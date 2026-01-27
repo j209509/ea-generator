@@ -1,4 +1,4 @@
-﻿from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import os
@@ -14,28 +14,37 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=[
+        "http://localhost:3000",
+        "https://app.ea-generator.com",
+        "https://ea-generator.com",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Firebase Admin init:
+# - local: GOOGLE_APPLICATION_CREDENTIALS があればサービスアカウントJSONを使う
+# - Cloud Run: 無ければ実行中のサービスアカウント(ADC)で初期化する
 if not firebase_admin._apps:
     cred_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
-    if not cred_path:
-        raise RuntimeError("GOOGLE_APPLICATION_CREDENTIALS is not set")
-    cred = credentials.Certificate(cred_path)
-    firebase_admin.initialize_app(cred)
+    if cred_path:
+        cred = credentials.Certificate(cred_path)
+        firebase_admin.initialize_app(cred)
+    else:
+        firebase_admin.initialize_app()
 
 openai_api_key = os.environ.get("OPENAI_API_KEY")
 if not openai_api_key:
     raise RuntimeError("OPENAI_API_KEY is not set")
 client = OpenAI(api_key=openai_api_key)
 
-MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.2-chat-latest")
 
 FREE_LIMIT = int(os.environ.get("FREE_LIMIT", "3"))
 _usage_by_uid: dict[str, int] = {}
+
 
 def verify_user(authorization: str) -> dict:
     if not authorization.startswith("Bearer "):
@@ -46,13 +55,16 @@ def verify_user(authorization: str) -> dict:
     except Exception:
         raise HTTPException(status_code=401, detail="invalid token")
 
+
 class GenerateReq(BaseModel):
     prompt: str
+
 
 @app.get("/me")
 def me(authorization: str = Header(default="")):
     decoded = verify_user(authorization)
     return {"uid": decoded.get("uid"), "email": decoded.get("email")}
+
 
 def build_system_prompt() -> str:
     return (
@@ -64,6 +76,7 @@ def build_system_prompt() -> str:
         "If requirements are ambiguous, make reasonable defaults and keep it simple.\n"
     )
 
+
 def _sanitize_ea_name(name: str) -> str:
     s = (name or "").strip()
     s = re.sub(r"\s+", "_", s)
@@ -72,6 +85,7 @@ def _sanitize_ea_name(name: str) -> str:
     if not s:
         s = "EA"
     return s[:32]
+
 
 def generate_ea_name(user_prompt: str, ea_code: str) -> str:
     sys_prompt = (
@@ -106,6 +120,7 @@ def generate_ea_name(user_prompt: str, ea_code: str) -> str:
         raw = ""
 
     return _sanitize_ea_name(raw)
+
 
 @app.post("/generate")
 def generate(body: GenerateReq, authorization: str = Header(default="")):
