@@ -67,14 +67,103 @@ def me(authorization: str = Header(default="")):
 
 
 def build_system_prompt() -> str:
+    # IMPORTANT:
+    # The frontend expects structured JSON so it can display EA Info separately
+    # from the EA source code, and so the downloaded file contains CODE ONLY.
     return (
         "You are an expert MetaTrader EA developer.\n"
-        "Return ONLY the full EA source code as plain text.\n"
-        "No markdown. No explanations. No code fences.\n"
-        "Target: MetaTrader 5 (MQL5) unless user explicitly requests MT4.\n"
-        "The output must compile (include required includes, inputs, OnInit/OnDeinit/OnTick, etc.).\n"
-        "If requirements are ambiguous, make reasonable defaults and keep it simple.\n"
+        "You MUST output ONLY valid JSON (no markdown, no code fences, no extra text).\n"
+        "The JSON MUST contain exactly these 4 keys: ea_name, ea_info, recommended_params, ea_code.\n"
+        "- ea_name: ASCII only (letters/digits/_/-), no spaces, 8-32 chars.\n"
+        "- ea_info: Japanese, <= 400 characters. Describe the EA briefly.\n"
+        "- recommended_params: Japanese. Up to 5 lines. Each line format: 'Name: Range (short note)'.\n"
+        "- ea_code: EA source code ONLY (MQL4 or MQL5 depending on the user's request).\n"
+        "  ASCII only inside ea_code (NO Japanese), and it must compile: includes, inputs, OnInit/OnDeinit/OnTick, helpers, etc.\n"
+        "If output becomes long, shorten ea_info/recommended_params, but NEVER omit ea_code.\n"
     )
+
+
+def _extract_json_obj(text: str) -> dict | None:
+    """Best-effort extraction of a JSON object from LLM output."""
+    if not text:
+        return None
+    t = text.strip()
+    if not t:
+        return None
+
+    # 1) Direct JSON
+    try:
+        obj = __import__("json").loads(t)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+
+    # 2) ```json ... ```
+    m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", t, flags=re.IGNORECASE)
+    if m:
+        try:
+            obj = __import__("json").loads(m.group(1))
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+
+    # 3) First '{' ... last '}'
+    first = t.find("{")
+    last = t.rfind("}")
+    if first >= 0 and last > first:
+        chunk = t[first : last + 1]
+        try:
+            obj = __import__("json").loads(chunk)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+
+    return None
+
+
+def _normalize_recommended_params(v) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, str):
+        s = v.strip()
+    elif isinstance(v, dict):
+        # Dict -> "k: v" lines
+        lines = []
+        for k, val in v.items():
+            vv = val if isinstance(val, str) else str(val)
+            lines.append(f"{k}: {vv}".strip())
+        s = "\n".join(lines).strip()
+    else:
+        s = str(v).strip()
+
+    # Enforce up to 5 lines
+    lines = [ln.strip() for ln in s.splitlines() if ln.strip()]
+    lines = lines[:5]
+    return "\n".join(lines)
+
+
+def _normalize_ea_info(v) -> str:
+    s = (v or "").strip() if isinstance(v, str) else str(v or "").strip()
+    # Roughly cap to 400 chars
+    return s[:400]
+
+
+def _ensure_ascii_only(s: str) -> str:
+    # Keep printable ASCII + newlines/tabs.
+    out = []
+    for ch in s:
+        o = ord(ch)
+        if ch in ("\n", "\r", "\t"):
+            out.append(ch)
+        elif 32 <= o <= 126:
+            out.append(ch)
+        else:
+            # Drop non-ASCII characters
+            pass
+    return "".join(out)
 
 
 def _sanitize_ea_name(name: str) -> str:
@@ -146,20 +235,47 @@ def generate(body: GenerateReq, authorization: str = Header(default="")):
                 {"role": "user", "content": user_prompt},
             ],
         )
-        ea_code = (resp.choices[0].message.content or "").strip()
+        raw_out = (resp.choices[0].message.content or "").strip()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"openai_error: {str(e)}")
 
-    if not ea_code:
+    if not raw_out:
         raise HTTPException(status_code=500, detail="openai returned empty output")
 
-    ea_name = generate_ea_name(user_prompt, ea_code)
+    obj = _extract_json_obj(raw_out)
+    if not obj:
+        # As a fallback, treat the entire output as code only.
+        # (This keeps the service usable even if the model violates format.)
+        ea_code_only = _ensure_ascii_only(raw_out)
+        ea_name = generate_ea_name(user_prompt, ea_code_only)
+        ea_info = ""
+        recommended_params = ""
+    else:
+        ea_name = _sanitize_ea_name(str(obj.get("ea_name") or ""))
+        ea_info = _normalize_ea_info(obj.get("ea_info") or "")
+        recommended_params = _normalize_recommended_params(obj.get("recommended_params") or "")
+
+        # Some models accidentally nest JSON into ea_code; if so, unwrap it.
+        ea_code_val = obj.get("ea_code")
+        if isinstance(ea_code_val, str) and ea_code_val.strip().startswith("{") and '"ea_code"' in ea_code_val:
+            inner = _extract_json_obj(ea_code_val)
+            if inner and isinstance(inner.get("ea_code"), str):
+                ea_code_val = inner.get("ea_code")
+
+        ea_code_only = _ensure_ascii_only(str(ea_code_val or "").strip())
+
+        # If model forgot ea_name, fall back to name generator.
+        if not ea_name or ea_name == "EA":
+            ea_name = generate_ea_name(user_prompt, ea_code_only)
+
+    if not ea_code_only:
+        raise HTTPException(status_code=500, detail="failed to obtain ea_code")
 
     used = used + 1
     _usage_by_uid[uid] = used
     remaining = max(FREE_LIMIT - used, 0)
 
-    preview = ea_code[:300].replace("\r\n", "\n")
+    preview = ea_code_only[:300].replace("\r\n", "\n")
 
     return {
         "ok": True,
@@ -170,6 +286,8 @@ def generate(body: GenerateReq, authorization: str = Header(default="")):
         "received_prompt_len": len(user_prompt),
         "preview": preview,
         "ea_name": ea_name,
-        "ea_code": ea_code,
+        "ea_info": ea_info,
+        "recommended_params": recommended_params,
+        "ea_code": ea_code_only,
         "ts": int(time.time()),
     }
