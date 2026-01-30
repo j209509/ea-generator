@@ -351,6 +351,80 @@ def _find_user_uid_by_stripe_ids(customer_id: str, subscription_id: str) -> Opti
     return None
 
 
+def _has_required_keys(d: dict) -> bool:
+    if not isinstance(d, dict):
+        return False
+    needed = {"ea_name", "ea_info", "recommended_params", "ea_code"}
+    return needed.issubset(set(d.keys()))
+
+
+def _unwrap_inner_json_if_needed(obj: dict) -> dict:
+    """
+    症状:
+      outer JSON は取れているが、outer["ea_code"] が JSON文字列になっているケース。
+    対応:
+      inner JSON を parse し、4キー揃っていれば inner を正として採用する。
+    """
+    try:
+        v = obj.get("ea_code")
+    except Exception:
+        return obj
+
+    if not isinstance(v, str):
+        return obj
+
+    s = v.strip()
+    if not s.startswith("{"):
+        return obj
+
+    # 速度と誤爆抑制のため、キーが見えるときだけ試す
+    if '"ea_code"' not in s or '"recommended_params"' not in s:
+        return obj
+
+    inner = _extract_json_obj(s)
+    if inner and _has_required_keys(inner):
+        return inner
+
+    return obj
+
+
+def _looks_like_mql_code(text: str) -> bool:
+    """
+    JSONパースに失敗したときに、生出力をEAコード扱いして良いかどうかの判定。
+    ここが甘いと「JSON全文がコード表示」になるので、意図的に厳しめにしています。
+    """
+    if not text:
+        return False
+    t = text.strip()
+    if not t:
+        return False
+
+    # JSONっぽいものは除外
+    if t.startswith("{") and ('"ea_code"' in t or '"ea_name"' in t):
+        return False
+
+    # 主要なMQLっぽさ
+    needles = [
+        "#include",
+        "OnInit",
+        "OnTick",
+        "OnDeinit",
+        "input ",
+        "MqlTradeRequest",
+        "CTrade",
+        "OrderSend",
+        "PositionSelect",
+        "SymbolInfoDouble",
+    ]
+    hit = 0
+    for n in needles:
+        if n in t:
+            hit += 1
+
+    # 2つ以上ヒットで採用
+    return hit >= 2
+
+
 @app.get("/billing/status")
 def billing_status(authorization: str = Header(default="")):
     decoded = verify_user(authorization)
@@ -466,26 +540,45 @@ def generate(body: GenerateReq, authorization: str = Header(default="")):
         raise HTTPException(status_code=500, detail="openai returned empty output")
 
     obj = _extract_json_obj(raw_out)
-    if not obj:
-        ea_code_only = _ensure_ascii_only(raw_out)
-        ea_name = generate_ea_name(user_prompt, ea_code_only)
-        ea_info = ""
-        recommended_params = ""
-    else:
-        ea_name = _sanitize_ea_name(str(obj.get("ea_name") or ""))
-        ea_info = _normalize_ea_info(obj.get("ea_info") or "")
-        recommended_params = _normalize_recommended_params(obj.get("recommended_params") or "")
 
-        ea_code_val = obj.get("ea_code")
-        if isinstance(ea_code_val, str) and ea_code_val.strip().startswith("{") and '"ea_code"' in ea_code_val:
-            inner = _extract_json_obj(ea_code_val)
-            if inner and isinstance(inner.get("ea_code"), str):
-                ea_code_val = inner.get("ea_code")
+    ea_name = ""
+    ea_info = ""
+    recommended_params = ""
+    ea_code_only = ""
 
+    if obj and isinstance(obj, dict):
+        # 内側JSONを優先採用（今回の症状対策の本丸）
+        obj2 = _unwrap_inner_json_if_needed(obj)
+
+        if not _has_required_keys(obj2):
+            # JSONは取れたが形式が崩れている場合は失敗扱い（生JSONをea_codeにしない）
+            raise HTTPException(status_code=500, detail="invalid model json shape")
+
+        ea_name = _sanitize_ea_name(str(obj2.get("ea_name") or ""))
+        ea_info = _normalize_ea_info(obj2.get("ea_info") or "")
+        recommended_params = _normalize_recommended_params(obj2.get("recommended_params") or "")
+
+        ea_code_val = obj2.get("ea_code")
         ea_code_only = _ensure_ascii_only(str(ea_code_val or "").strip())
+
+        # 最後の保険: ea_codeがJSONっぽいなら弾く
+        s = ea_code_only.lstrip()
+        if s.startswith("{") and ('"ea_code"' in s or '"ea_name"' in s):
+            raise HTTPException(status_code=500, detail="ea_code contains json (refused)")
 
         if not ea_name or ea_name == "EA":
             ea_name = generate_ea_name(user_prompt, ea_code_only)
+
+    else:
+        # JSON抽出に失敗した場合は「コードっぽい」時だけ救済する
+        if _looks_like_mql_code(raw_out):
+            ea_code_only = _ensure_ascii_only(raw_out)
+            ea_name = generate_ea_name(user_prompt, ea_code_only)
+            ea_info = ""
+            recommended_params = ""
+        else:
+            # ここで raw_out を ea_code に入れると、今回の「全部コード表示」事故になる
+            raise HTTPException(status_code=500, detail="failed to parse model output as json")
 
     if not ea_code_only:
         raise HTTPException(status_code=500, detail="failed to obtain ea_code")
