@@ -48,8 +48,7 @@ client = OpenAI(api_key=openai_api_key)
 
 MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.2-chat-latest")
 
-FREE_LIMIT = int(os.environ.get("FREE_LIMIT", "3"))
-
+FREE_LIMIT = 3  # free users can generate up to 3 times
 # Stripe webhook signing secret (Stripe Dashboard -> Webhooks -> endpoint -> Signing secret)
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "").strip()
 
