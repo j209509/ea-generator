@@ -47,6 +47,12 @@ if not openai_api_key:
 client = OpenAI(api_key=openai_api_key)
 
 MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.2-chat-latest")
+try:
+    MAX_GENERATION_PASSES = max(1, int(os.environ.get("MAX_GENERATION_PASSES", "3")))
+except Exception:
+    MAX_GENERATION_PASSES = 3
+
+STATIC_ISSUE_LIMIT = 12
 
 FREE_LIMIT = 3  # free users can generate up to 3 times
 # Stripe webhook signing secret (Stripe Dashboard -> Webhooks -> endpoint -> Signing secret)
@@ -76,21 +82,94 @@ def me(authorization: str = Header(default="")):
     return {"uid": decoded.get("uid"), "email": decoded.get("email")}
 
 
-def build_system_prompt() -> str:
+def _detect_platform(user_prompt: str) -> str:
+    t = (user_prompt or "").upper()
+    m = re.search(r"\bMT\s*:\s*(MT4|MT5)\b", t)
+    if m:
+        return m.group(1)
+
+    idx4 = t.find("MT4")
+    idx5 = t.find("MT5")
+    if idx4 >= 0 and idx5 < 0:
+        return "MT4"
+    if idx5 >= 0 and idx4 < 0:
+        return "MT5"
+    if idx4 >= 0 and idx5 >= 0:
+        return "MT4" if idx4 < idx5 else "MT5"
+    return "MT5"
+
+
+def _platform_prompt_rules(platform: str) -> str:
+    if platform == "MT4":
+        return (
+            "Target platform is MT4 / MQL4 only.\n"
+            "Use MT4-safe APIs only.\n"
+            "Allowed trading style: OrderSend / OrderClose / OrderSelect / OrdersTotal / MarketInfo / Bid / Ask.\n"
+            "Do NOT use MT5-only APIs such as MqlTradeRequest, MqlTradeResult, CTrade, PositionSelect, PositionGet*, trade.Buy, trade.Sell.\n"
+            "Use #property strict.\n"
+            "Implement OnInit, OnDeinit, and OnTick in one file.\n"
+            "Do not leave unused variables, dead code, placeholders, or pseudo code.\n"
+        )
+
+    return (
+        "Target platform is MT5 / MQL5 only.\n"
+        "Use MT5-safe APIs only.\n"
+        "If the EA places trades, prefer #include <Trade/Trade.mqh> and a CTrade instance.\n"
+        "If indicators are used, create handles in OnInit, release them in OnDeinit, and read values with CopyBuffer.\n"
+        "Do NOT use MT4-only APIs such as OP_BUY/OP_SELL, MarketInfo, RefreshRates, OrderSelect by position/mode, OrdersTotal, OrderType, Bid, Ask.\n"
+        "Use _Symbol, _Point, _Digits, SymbolInfoDouble, PositionSelect as needed.\n"
+        "Use #property strict.\n"
+        "Implement OnInit, OnDeinit, and OnTick in one file.\n"
+        "Do not leave unused variables, dead code, placeholders, or pseudo code.\n"
+    )
+
+
+def build_system_prompt(platform: str) -> str:
     # IMPORTANT:
     # The frontend expects structured JSON so it can display EA Info separately
     # from the EA source code, and so the downloaded file contains CODE ONLY.
     return (
-        "You are an expert MetaTrader EA developer.\n"
+        "You are an expert MetaTrader EA developer focused on compile-safe output.\n"
         "You MUST output ONLY valid JSON (no markdown, no code fences, no extra text).\n"
         "The JSON MUST contain exactly these 4 keys: ea_name, ea_info, recommended_params, ea_code.\n"
         "- ea_name: ASCII only (letters/digits/_/-), no spaces, 8-32 chars.\n"
         "- ea_info: Japanese, <= 400 characters. Describe the EA briefly.\n"
         "- recommended_params: Japanese. Up to 5 lines. Each line format: 'Name: Range (short note)'.\n"
         "- ea_code: EA source code ONLY (MQL4 or MQL5 depending on the user's request).\n"
-        "  ASCII only inside ea_code (NO Japanese), and it must compile: includes, inputs, OnInit/OnDeinit/OnTick, helpers, etc.\n"
+        "  ASCII only inside ea_code (NO Japanese).\n"
+        "Before finalizing, internally perform a strict compile-minded review:\n"
+        "- no mixed MT4/MT5 APIs\n"
+        "- no undeclared identifiers\n"
+        "- no missing includes for used classes\n"
+        "- no placeholder comments or pseudo code\n"
+        "- no unused variables if they would create warnings\n"
+        "- balanced braces, parentheses, and brackets\n"
+        "- complete event handlers and helper functions\n"
+        "Prefer a simpler but cleaner EA over a complex EA with compile risk.\n"
+        f"{_platform_prompt_rules(platform)}"
         "If output becomes long, shorten ea_info/recommended_params, but NEVER omit ea_code.\n"
     )
+
+
+def build_repair_system_prompt(platform: str) -> str:
+    return (
+        "You repair MetaTrader EA source code so it becomes structurally compile-safe.\n"
+        "Return ONLY valid JSON with exactly these 4 keys: ea_name, ea_info, recommended_params, ea_code.\n"
+        "Preserve the original trading intent, but simplify aggressively if needed to remove compile risk.\n"
+        "Never output markdown, explanations, or code fences.\n"
+        f"{_platform_prompt_rules(platform)}"
+    )
+
+
+def _call_model(system_prompt: str, user_message: str) -> str:
+    resp = client.chat.completions.create(
+        model=MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ],
+    )
+    return (resp.choices[0].message.content or "").strip()
 
 
 def _extract_json_obj(text: str) -> dict | None:
@@ -183,7 +262,7 @@ def _sanitize_ea_name(name: str) -> str:
 
 def generate_ea_name(user_prompt: str, ea_code: str) -> str:
     sys_prompt = (
-        "You generate short filenames for MetaTrader 5 EA source.\n"
+        "You generate short filenames for MetaTrader EA source.\n"
         "Output ONLY ONE LINE: an ASCII name using letters, digits, underscore.\n"
         "No spaces. No extension. Length 8-32.\n"
         "Do not include words like draft, version, test.\n"
@@ -202,14 +281,7 @@ def generate_ea_name(user_prompt: str, ea_code: str) -> str:
     )
 
     try:
-        resp = client.chat.completions.create(
-            model=MODEL,
-            messages=[
-                {"role": "system", "content": sys_prompt},
-                {"role": "user", "content": user_msg},
-            ],
-        )
-        raw = (resp.choices[0].message.content or "").strip()
+        raw = _call_model(sys_prompt, user_msg)
     except Exception:
         raw = ""
 
@@ -425,6 +497,246 @@ def _looks_like_mql_code(text: str) -> bool:
     return hit >= 2
 
 
+def _dedupe_keep_order(items: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        s = (item or "").strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def _collect_balance_issues(code: str) -> list[str]:
+    issues: list[str] = []
+    stack: list[tuple[str, int]] = []
+    in_line_comment = False
+    in_block_comment = False
+    in_string = ""
+    escaped = False
+    i = 0
+    pairs = {"{": "}", "(": ")", "[": "]"}
+    closing = {v: k for k, v in pairs.items()}
+
+    while i < len(code):
+        ch = code[i]
+        nxt = code[i + 1] if i + 1 < len(code) else ""
+
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+            i += 1
+            continue
+
+        if in_block_comment:
+            if ch == "*" and nxt == "/":
+                in_block_comment = False
+                i += 2
+                continue
+            i += 1
+            continue
+
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == in_string:
+                in_string = ""
+            i += 1
+            continue
+
+        if ch == "/" and nxt == "/":
+            in_line_comment = True
+            i += 2
+            continue
+
+        if ch == "/" and nxt == "*":
+            in_block_comment = True
+            i += 2
+            continue
+
+        if ch in ('"', "'"):
+            in_string = ch
+            i += 1
+            continue
+
+        if ch in pairs:
+            stack.append((ch, i))
+        elif ch in closing:
+            if not stack or stack[-1][0] != closing[ch]:
+                issues.append(f"Unbalanced delimiter near character {i + 1}: unexpected '{ch}'.")
+                break
+            stack.pop()
+
+        i += 1
+
+    if in_string:
+        issues.append("Unterminated string literal detected.")
+    if in_block_comment:
+        issues.append("Unterminated block comment detected.")
+    if stack:
+        opener, pos = stack[-1]
+        issues.append(f"Unbalanced delimiter near character {pos + 1}: missing closing pair for '{opener}'.")
+
+    return issues
+
+
+def _collect_static_issues(code: str, platform: str) -> list[str]:
+    issues: list[str] = []
+    src = (code or "").strip()
+    if not src:
+        return ["ea_code is empty."]
+
+    if "```" in src:
+        issues.append("ea_code still contains markdown code fences.")
+    if src.startswith("{") and ('\"ea_code\"' in src or '\"ea_name\"' in src):
+        issues.append("ea_code still contains JSON instead of source code.")
+    if "#property strict" not in src:
+        issues.append("Add '#property strict' near the top of the file.")
+    if not re.search(r"\b(?:int|void)\s+OnInit\s*\(", src):
+        issues.append("Implement OnInit with an explicit return type.")
+    if not re.search(r"\bvoid\s+OnTick\s*\(", src):
+        issues.append("Implement OnTick with an explicit return type.")
+    if not re.search(r"\bvoid\s+OnDeinit\s*\(", src):
+        issues.append("Implement OnDeinit with an explicit return type.")
+    if re.search(r"\b(TODO|FIXME|your logic here|pseudo code|placeholder)\b", src, flags=re.IGNORECASE):
+        issues.append("Remove placeholders, TODOs, and pseudo code.")
+
+    issues.extend(_collect_balance_issues(src))
+
+    if ("CTrade" in src or re.search(r"\btrade\.", src)) and "#include <Trade/Trade.mqh>" not in src:
+        issues.append("CTrade or trade.* is used without '#include <Trade/Trade.mqh>'.")
+    if re.search(r"\btrade\.", src) and not re.search(r"\bCTrade\s+\w+\s*;", src):
+        issues.append("trade.* is used but no CTrade instance is declared.")
+
+    if platform == "MT5":
+        if re.search(r"\bOP_(BUY|SELL|BUYLIMIT|SELLLIMIT|BUYSTOP|SELLSTOP)\b", src):
+            issues.append("MT5 code contains MT4 order constants such as OP_BUY/OP_SELL.")
+        if re.search(r"\b(OrderSelect|OrdersTotal|OrderType|OrderTicket|OrderMagicNumber|OrderOpenPrice|OrderClosePrice|OrderSymbol)\b", src):
+            issues.append("MT5 code uses MT4 order inspection APIs such as OrderSelect/OrdersTotal.")
+        if re.search(r"\b(MarketInfo|RefreshRates)\s*\(", src):
+            issues.append("MT5 code uses MT4-only helpers such as MarketInfo/RefreshRates.")
+        if re.search(r"(?<![_A-Za-z0-9])(Bid|Ask)(?![_A-Za-z0-9])", src):
+            issues.append("MT5 code uses global Bid/Ask instead of SymbolInfoDouble or current tick data.")
+        if "OrderSend(" in src and "MqlTradeRequest" not in src and "MqlTradeResult" not in src and "CTrade" not in src:
+            issues.append("MT5 code appears to use an MT4-style OrderSend call.")
+        if "CopyBuffer(" in src and "INVALID_HANDLE" not in src:
+            issues.append("MT5 code uses CopyBuffer but does not visibly guard indicator handles with INVALID_HANDLE checks.")
+    else:
+        if re.search(r"\b(MqlTradeRequest|MqlTradeResult|MqlTick|CTrade|PositionSelect|PositionGet|HistoryDealGet|HistoryOrderGet)\b", src):
+            issues.append("MT4 code contains MT5-only trade APIs such as MqlTradeRequest/CTrade/PositionSelect.")
+        if "#include <Trade/Trade.mqh>" in src:
+            issues.append("MT4 code includes the MT5 Trade.mqh header.")
+        if re.search(r"\btrade\.(Buy|Sell|PositionOpen|PositionClose)\b", src):
+            issues.append("MT4 code uses MT5 CTrade helper methods.")
+        if "CopyBuffer(" in src:
+            issues.append("MT4 code uses CopyBuffer, which is a common source of MT5-style mixed code.")
+
+    return _dedupe_keep_order(issues)[:STATIC_ISSUE_LIMIT]
+
+
+def _normalize_model_output(raw_out: str, user_prompt: str) -> dict[str, str]:
+    obj = _extract_json_obj(raw_out)
+
+    if obj and isinstance(obj, dict):
+        obj2 = _unwrap_inner_json_if_needed(obj)
+
+        if not _has_required_keys(obj2):
+            raise ValueError("invalid model json shape")
+
+        ea_name = _sanitize_ea_name(str(obj2.get("ea_name") or ""))
+        ea_info = _normalize_ea_info(obj2.get("ea_info") or "")
+        recommended_params = _normalize_recommended_params(obj2.get("recommended_params") or "")
+
+        ea_code_val = obj2.get("ea_code")
+        ea_code_only = _ensure_ascii_only(str(ea_code_val or "").strip())
+        s = ea_code_only.lstrip()
+        if s.startswith("{") and ('\"ea_code\"' in s or '\"ea_name\"' in s):
+            raise ValueError("ea_code contains json (refused)")
+
+        if not ea_name or ea_name == "EA":
+            ea_name = generate_ea_name(user_prompt, ea_code_only)
+
+        return {
+            "ea_name": ea_name,
+            "ea_info": ea_info,
+            "recommended_params": recommended_params,
+            "ea_code": ea_code_only,
+        }
+
+    if _looks_like_mql_code(raw_out):
+        ea_code_only = _ensure_ascii_only(raw_out)
+        return {
+            "ea_name": generate_ea_name(user_prompt, ea_code_only),
+            "ea_info": "",
+            "recommended_params": "",
+            "ea_code": ea_code_only,
+        }
+
+    raise ValueError("failed to parse model output as json")
+
+
+def _build_repair_user_prompt(
+    user_prompt: str,
+    platform: str,
+    raw_out: str,
+    issues: list[str],
+    parsed: Optional[dict[str, str]] = None,
+) -> str:
+    current = json.dumps(parsed, ensure_ascii=True) if parsed else raw_out
+    bullet_issues = "\n".join(f"- {item}" for item in issues) if issues else "- Output is not valid yet."
+    return (
+        f"Original user requirement:\n{user_prompt}\n\n"
+        f"Target platform: {platform}\n\n"
+        "Current candidate output:\n"
+        f"{current}\n\n"
+        "Fix all of these problems:\n"
+        f"{bullet_issues}\n\n"
+        "Return a FULL corrected JSON object with exactly these 4 keys: ea_name, ea_info, recommended_params, ea_code.\n"
+        "The result must be safer to compile than the current candidate.\n"
+        "Preserve the strategy intent, but delete or simplify risky code if needed.\n"
+        "No markdown. No explanation.\n"
+    )
+
+
+def _generate_validated_ea(user_prompt: str) -> dict[str, str]:
+    platform = _detect_platform(user_prompt)
+    raw_out = ""
+    parsed: Optional[dict[str, str]] = None
+    issues: list[str] = []
+
+    for attempt in range(MAX_GENERATION_PASSES):
+        if attempt == 0:
+            raw_out = _call_model(build_system_prompt(platform), user_prompt)
+        else:
+            raw_out = _call_model(
+                build_repair_system_prompt(platform),
+                _build_repair_user_prompt(user_prompt, platform, raw_out, issues, parsed),
+            )
+
+        if not raw_out:
+            parsed = None
+            issues = ["openai returned empty output"]
+            continue
+
+        try:
+            parsed = _normalize_model_output(raw_out, user_prompt)
+        except ValueError as e:
+            parsed = None
+            issues = [str(e)]
+            continue
+
+        issues = _collect_static_issues(parsed.get("ea_code") or "", platform)
+        if not issues:
+            return parsed
+
+    detail = "; ".join(issues) if issues else "validation failed"
+    raise HTTPException(status_code=500, detail=f"generation_validation_failed: {detail}")
+
+
 @app.get("/billing/status")
 def billing_status(authorization: str = Header(default="")):
     decoded = verify_user(authorization)
@@ -522,22 +834,14 @@ def generate(body: GenerateReq, authorization: str = Header(default="")):
     if not user_prompt:
         raise HTTPException(status_code=422, detail="prompt is required")
 
-    sys_prompt = build_system_prompt()
-
     try:
-        resp = client.chat.completions.create(
-            model=MODEL,
-            messages=[
-                {"role": "system", "content": sys_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-        )
-        raw_out = (resp.choices[0].message.content or "").strip()
+        candidate = _generate_validated_ea(user_prompt)
     except Exception as e:
+        if isinstance(e, HTTPException):
+            raise e
         raise HTTPException(status_code=500, detail=f"openai_error: {str(e)}")
 
-    if not raw_out:
-        raise HTTPException(status_code=500, detail="openai returned empty output")
+    raw_out = json.dumps(candidate, ensure_ascii=True)
 
     obj = _extract_json_obj(raw_out)
 
