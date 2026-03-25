@@ -7,6 +7,7 @@ import re
 import json
 import hmac
 import hashlib
+import secrets
 from typing import Any, Optional, Tuple
 
 import firebase_admin
@@ -60,6 +61,7 @@ STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "").strip()
 
 # Firestore collection name for user states
 USERS_COL = os.environ.get("USERS_COLLECTION", "users").strip() or "users"
+SHARES_COL = os.environ.get("SHARES_COLLECTION", "shared_eas").strip() or "shared_eas"
 
 
 def verify_user(authorization: str) -> dict:
@@ -74,6 +76,16 @@ def verify_user(authorization: str) -> dict:
 
 class GenerateReq(BaseModel):
     prompt: str
+
+
+class ShareCreateReq(BaseModel):
+    ea_name: str = ""
+    ea_info: str = ""
+    recommended_params: Any = ""
+    ea_code: str = ""
+    filename: str = ""
+    platform: str = ""
+    source_prompt: str = ""
 
 
 @app.get("/me")
@@ -286,6 +298,119 @@ def generate_ea_name(user_prompt: str, ea_code: str) -> str:
         raw = ""
 
     return _sanitize_ea_name(raw)
+
+
+def _share_doc_ref(share_id: str):
+    return db.collection(SHARES_COL).document(share_id)
+
+
+def _new_share_id() -> str:
+    for _ in range(8):
+        share_id = secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:10]
+        if share_id and not _share_doc_ref(share_id).get().exists:
+            return share_id
+    raise HTTPException(status_code=500, detail="failed to allocate share id")
+
+
+def _serialize_value(v: Any) -> Any:
+    if v is None:
+        return None
+    if hasattr(v, "isoformat"):
+        try:
+            return v.isoformat()
+        except Exception:
+            return str(v)
+    return v
+
+
+def _normalize_platform_value(platform: str, filename: str, code: str, source_prompt: str = "") -> str:
+    p = (platform or "").strip().upper()
+    if p in ("MT4", "MT5"):
+        return p
+
+    name = (filename or "").lower().strip()
+    if name.endswith(".mq4"):
+        return "MT4"
+    if name.endswith(".mq5"):
+        return "MT5"
+
+    combined = f"{source_prompt}\n{code}"
+    detected = _detect_platform(combined)
+    return detected if detected in ("MT4", "MT5") else "MT5"
+
+
+def _fallback_public_summary(ea_name: str, platform: str, ea_info: str, recommended_params: str) -> str:
+    base = (ea_info or "").strip()
+    if not base:
+        base = f"{ea_name} is a shared {platform} EA idea."
+    base = re.sub(r"\s+", " ", base).strip()
+    if len(base) > 110:
+        base = base[:107].rstrip() + "..."
+
+    if recommended_params:
+        first_line = recommended_params.splitlines()[0].strip()
+        if first_line:
+            base = f"{base} Parameters: {first_line}"
+            if len(base) > 140:
+                base = base[:137].rstrip() + "..."
+
+    return base
+
+
+def _generate_public_summary(ea_name: str, platform: str, ea_info: str, recommended_params: str) -> str:
+    fallback = _fallback_public_summary(ea_name, platform, ea_info, recommended_params)
+    user_msg = (
+        f"EA name: {ea_name}\n"
+        f"Platform: {platform}\n"
+        f"EA info: {ea_info}\n"
+        f"Recommended params:\n{recommended_params}\n\n"
+        "Write a simple Japanese teaser for an EA share page.\n"
+        "Requirements:\n"
+        "- 80 to 140 Japanese characters\n"
+        "- Explain the trading logic at a high level in plain language\n"
+        "- No hype, no guarantees, no markdown\n"
+        "- Mention MT4 or MT5 only if helpful\n"
+        "- Output only the teaser text\n"
+    )
+
+    try:
+        raw = _call_model(
+            "You write short, neutral Japanese teaser copy for trading EA share pages. Output plain text only.",
+            user_msg,
+        )
+        text = re.sub(r"\s+", " ", (raw or "").strip())
+        if not text:
+            return fallback
+        if len(text) > 150:
+            text = text[:147].rstrip() + "..."
+        return text
+    except Exception:
+        return fallback
+
+
+def _share_public_payload(data: dict, share_id: str) -> dict[str, Any]:
+    return {
+        "share_id": share_id,
+        "ea_name": str(data.get("ea_name") or ""),
+        "platform": str(data.get("platform") or ""),
+        "public_summary": str(data.get("public_summary") or ""),
+        "created_at": _serialize_value(data.get("created_at")),
+        "updated_at": _serialize_value(data.get("updated_at")),
+    }
+
+
+def _share_detail_payload(data: dict, share_id: str) -> dict[str, Any]:
+    payload = _share_public_payload(data, share_id)
+    payload.update(
+        {
+            "ea_info": str(data.get("ea_info") or ""),
+            "recommended_params": str(data.get("recommended_params") or ""),
+            "ea_code": str(data.get("ea_code") or ""),
+            "filename": str(data.get("filename") or ""),
+            "owner_uid": str(data.get("owner_uid") or ""),
+        }
+    )
+    return payload
 
 
 def _user_doc_ref(uid: str):
@@ -752,6 +877,79 @@ def billing_status(authorization: str = Header(default="")):
         "remaining": _remaining_from_state(state),
         "ts": int(time.time()),
     }
+
+
+@app.post("/shares")
+def create_share(body: ShareCreateReq, authorization: str = Header(default="")):
+    decoded = verify_user(authorization)
+    uid = decoded.get("uid") or "unknown"
+    email = decoded.get("email") or ""
+
+    ea_code = _ensure_ascii_only(str(body.ea_code or "").strip())
+    if not ea_code:
+        raise HTTPException(status_code=422, detail="ea_code is required")
+
+    ea_name = _sanitize_ea_name(str(body.ea_name or ""))
+    if not ea_name or ea_name == "EA":
+        ea_name = generate_ea_name(str(body.source_prompt or ""), ea_code)
+
+    ea_info = _normalize_ea_info(body.ea_info or "")
+    recommended_params = _normalize_recommended_params(body.recommended_params or "")
+    filename = str(body.filename or "").strip()
+    platform = _normalize_platform_value(str(body.platform or ""), filename, ea_code, str(body.source_prompt or ""))
+    public_summary = _generate_public_summary(ea_name, platform, ea_info, recommended_params)
+
+    share_id = _new_share_id()
+    now = firestore.SERVER_TIMESTAMP
+    payload = {
+        "owner_uid": uid,
+        "owner_email": email,
+        "ea_name": ea_name,
+        "ea_info": ea_info,
+        "recommended_params": recommended_params,
+        "ea_code": ea_code,
+        "filename": filename,
+        "platform": platform,
+        "public_summary": public_summary,
+        "created_at": now,
+        "updated_at": now,
+    }
+    _share_doc_ref(share_id).set(payload, merge=True)
+
+    return {
+        "ok": True,
+        "share_id": share_id,
+        "public": _share_public_payload({**payload, "created_at": int(time.time()), "updated_at": int(time.time())}, share_id),
+    }
+
+
+@app.get("/shares/{share_id}/public")
+def get_share_public(share_id: str):
+    sid = (share_id or "").strip()
+    if not sid:
+        raise HTTPException(status_code=404, detail="share not found")
+
+    snap = _share_doc_ref(sid).get()
+    if not snap.exists:
+        raise HTTPException(status_code=404, detail="share not found")
+
+    data = snap.to_dict() or {}
+    return {"ok": True, "share": _share_public_payload(data, sid)}
+
+
+@app.get("/shares/{share_id}")
+def get_share_detail(share_id: str, authorization: str = Header(default="")):
+    verify_user(authorization)
+    sid = (share_id or "").strip()
+    if not sid:
+        raise HTTPException(status_code=404, detail="share not found")
+
+    snap = _share_doc_ref(sid).get()
+    if not snap.exists:
+        raise HTTPException(status_code=404, detail="share not found")
+
+    data = snap.to_dict() or {}
+    return {"ok": True, "share": _share_detail_payload(data, sid)}
 
 
 @app.post("/stripe/webhook")
