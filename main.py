@@ -174,7 +174,12 @@ def build_repair_system_prompt(platform: str) -> str:
     return (
         "You repair MetaTrader EA source code so it becomes structurally compile-safe.\n"
         "Return ONLY valid JSON with exactly these 4 keys: ea_name, ea_info, recommended_params, ea_code.\n"
+        "- ea_name: ASCII only (letters/digits/_/-), no spaces, 8-32 chars.\n"
+        "- ea_info: Japanese, <= 400 characters.\n"
+        "- recommended_params: Japanese. Up to 5 lines. Each line format: 'Name: Range (short note)'.\n"
+        "- ea_code: FULL EA source code ONLY, ASCII only inside ea_code.\n"
         "Preserve the original trading intent, but simplify aggressively if needed to remove compile risk.\n"
+        "If ea_info or recommended_params are in English, rewrite them into natural Japanese before returning.\n"
         "Never output markdown, explanations, or code fences.\n"
         f"{_platform_prompt_rules(platform)}"
     )
@@ -185,11 +190,15 @@ def build_improve_system_prompt(platform: str) -> str:
         "You improve an existing MetaTrader EA source code file.\n"
         "You will receive the current EA code, the user's requested changes, and optionally compiler errors.\n"
         "Return ONLY valid JSON with exactly these 4 keys: ea_name, ea_info, recommended_params, ea_code.\n"
+        "- ea_name: ASCII only (letters/digits/_/-), no spaces, 8-32 chars.\n"
+        "- ea_info: Japanese, <= 400 characters.\n"
+        "- recommended_params: Japanese. Up to 5 lines. Each line format: 'Name: Range (short note)'.\n"
         "- Preserve the original strategy intent unless the user explicitly asks to change it.\n"
         "- Fix compiler problems first when error logs are provided.\n"
         "- Modify only what is necessary; keep working parts stable when reasonable.\n"
         "- ea_code must be the FULL source code for one file.\n"
         "- ea_code must stay ASCII only.\n"
+        "- If ea_info or recommended_params are in English, rewrite them into natural Japanese.\n"
         "Never output markdown, explanations, or code fences.\n"
         f"{_platform_prompt_rules(platform)}"
     )
@@ -845,6 +854,7 @@ def _build_repair_user_prompt(
         "Return a FULL corrected JSON object with exactly these 4 keys: ea_name, ea_info, recommended_params, ea_code.\n"
         "The result must be safer to compile than the current candidate.\n"
         "Preserve the strategy intent, but delete or simplify risky code if needed.\n"
+        "ea_info and recommended_params must be natural Japanese.\n"
         "No markdown. No explanation.\n"
     )
 
@@ -878,6 +888,7 @@ def _build_improve_user_prompt(
             "",
             "Return a FULL corrected JSON object with exactly these 4 keys: ea_name, ea_info, recommended_params, ea_code.",
             "Keep the behavior close to the original EA unless the request says otherwise.",
+            "ea_info and recommended_params must be natural Japanese.",
             "No markdown. No explanation.",
         ]
     )
