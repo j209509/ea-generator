@@ -78,6 +78,13 @@ class GenerateReq(BaseModel):
     prompt: str
 
 
+class ImproveReq(BaseModel):
+    instruction: str = ""
+    existing_code: str = ""
+    compiler_errors: str = ""
+    platform: str = ""
+
+
 class ShareCreateReq(BaseModel):
     ea_name: str = ""
     ea_info: str = ""
@@ -168,6 +175,21 @@ def build_repair_system_prompt(platform: str) -> str:
         "You repair MetaTrader EA source code so it becomes structurally compile-safe.\n"
         "Return ONLY valid JSON with exactly these 4 keys: ea_name, ea_info, recommended_params, ea_code.\n"
         "Preserve the original trading intent, but simplify aggressively if needed to remove compile risk.\n"
+        "Never output markdown, explanations, or code fences.\n"
+        f"{_platform_prompt_rules(platform)}"
+    )
+
+
+def build_improve_system_prompt(platform: str) -> str:
+    return (
+        "You improve an existing MetaTrader EA source code file.\n"
+        "You will receive the current EA code, the user's requested changes, and optionally compiler errors.\n"
+        "Return ONLY valid JSON with exactly these 4 keys: ea_name, ea_info, recommended_params, ea_code.\n"
+        "- Preserve the original strategy intent unless the user explicitly asks to change it.\n"
+        "- Fix compiler problems first when error logs are provided.\n"
+        "- Modify only what is necessary; keep working parts stable when reasonable.\n"
+        "- ea_code must be the FULL source code for one file.\n"
+        "- ea_code must stay ASCII only.\n"
         "Never output markdown, explanations, or code fences.\n"
         f"{_platform_prompt_rules(platform)}"
     )
@@ -827,6 +849,80 @@ def _build_repair_user_prompt(
     )
 
 
+def _build_improve_user_prompt(
+    instruction: str,
+    platform: str,
+    existing_code: str,
+    compiler_errors: str,
+) -> str:
+    request_text = (instruction or "").strip() or "Fix compile issues and improve the existing EA while preserving its behavior."
+    out = [
+        f"Target platform: {platform}",
+        "",
+        "Improvement request:",
+        request_text,
+        "",
+        "Existing EA source:",
+        existing_code,
+    ]
+    if (compiler_errors or "").strip():
+        out.extend(
+            [
+                "",
+                "Compiler error log:",
+                compiler_errors.strip(),
+            ]
+        )
+    out.extend(
+        [
+            "",
+            "Return a FULL corrected JSON object with exactly these 4 keys: ea_name, ea_info, recommended_params, ea_code.",
+            "Keep the behavior close to the original EA unless the request says otherwise.",
+            "No markdown. No explanation.",
+        ]
+    )
+    return "\n".join(out)
+
+
+def _build_improve_repair_user_prompt(
+    instruction: str,
+    platform: str,
+    existing_code: str,
+    compiler_errors: str,
+    raw_out: str,
+    issues: list[str],
+    parsed: Optional[dict[str, str]] = None,
+) -> str:
+    current = json.dumps(parsed, ensure_ascii=True) if parsed else raw_out
+    bullet_issues = "\n".join(f"- {item}" for item in issues) if issues else "- Output is not valid yet."
+    request_text = (instruction or "").strip() or "Fix compile issues and improve the existing EA while preserving its behavior."
+    parts = [
+        f"Improvement request:\n{request_text}",
+        "",
+        f"Target platform: {platform}",
+        "",
+        "Original EA source:",
+        existing_code,
+    ]
+    if (compiler_errors or "").strip():
+        parts.extend(["", "Compiler error log:", compiler_errors.strip()])
+    parts.extend(
+        [
+            "",
+            "Current candidate output:",
+            current,
+            "",
+            "Fix all of these problems:",
+            bullet_issues,
+            "",
+            "Return a FULL corrected JSON object with exactly these 4 keys: ea_name, ea_info, recommended_params, ea_code.",
+            "Keep the behavior close to the original EA unless the request says otherwise.",
+            "No markdown. No explanation.",
+        ]
+    )
+    return "\n".join(parts)
+
+
 def _generate_validated_ea(user_prompt: str) -> dict[str, str]:
     platform = _detect_platform(user_prompt)
     raw_out = ""
@@ -860,6 +956,89 @@ def _generate_validated_ea(user_prompt: str) -> dict[str, str]:
 
     detail = "; ".join(issues) if issues else "validation failed"
     raise HTTPException(status_code=500, detail=f"generation_validation_failed: {detail}")
+
+
+def _generate_validated_improved_ea(
+    instruction: str,
+    existing_code: str,
+    compiler_errors: str,
+    platform_hint: str,
+) -> dict[str, str]:
+    source = str(existing_code or "").strip()
+    if not source:
+        raise HTTPException(status_code=422, detail="existing_code is required")
+
+    platform = _normalize_platform_value(str(platform_hint or ""), "", source, str(instruction or ""))
+    raw_out = ""
+    parsed: Optional[dict[str, str]] = None
+    issues: list[str] = []
+
+    for attempt in range(MAX_GENERATION_PASSES):
+        if attempt == 0:
+            raw_out = _call_model(
+                build_improve_system_prompt(platform),
+                _build_improve_user_prompt(instruction, platform, source, compiler_errors),
+            )
+        else:
+            raw_out = _call_model(
+                build_repair_system_prompt(platform),
+                _build_improve_repair_user_prompt(instruction, platform, source, compiler_errors, raw_out, issues, parsed),
+            )
+
+        if not raw_out:
+            parsed = None
+            issues = ["openai returned empty output"]
+            continue
+
+        try:
+            parsed = _normalize_model_output(raw_out, instruction or source[:500])
+        except ValueError as e:
+            parsed = None
+            issues = [str(e)]
+            continue
+
+        issues = _collect_static_issues(parsed.get("ea_code") or "", platform)
+        if not issues:
+            return parsed
+
+    detail = "; ".join(issues) if issues else "validation failed"
+    raise HTTPException(status_code=500, detail=f"improve_validation_failed: {detail}")
+
+
+def _build_generation_success_response(candidate: dict[str, str], user_prompt: str, uid: str, is_pro: bool, used_free: int) -> dict:
+    ea_name = _sanitize_ea_name(str(candidate.get("ea_name") or ""))
+    ea_info = _normalize_ea_info(candidate.get("ea_info") or "")
+    recommended_params = _normalize_recommended_params(candidate.get("recommended_params") or "")
+    ea_code_only = _ensure_ascii_only(str(candidate.get("ea_code") or "").strip())
+
+    if not ea_name or ea_name == "EA":
+        ea_name = generate_ea_name(user_prompt, ea_code_only)
+
+    if not ea_code_only:
+        raise HTTPException(status_code=500, detail="failed to obtain ea_code")
+
+    if is_pro:
+        used = used_free
+        remaining = 999999
+    else:
+        used, remaining = _increment_free_count(uid)
+
+    preview = ea_code_only[:300].replace("\r\n", "\n")
+
+    return {
+        "ok": True,
+        "uid": uid,
+        "used": used,
+        "remaining": remaining,
+        "model": MODEL,
+        "received_prompt_len": len(user_prompt),
+        "preview": preview,
+        "ea_name": ea_name,
+        "ea_info": ea_info,
+        "recommended_params": recommended_params,
+        "ea_code": ea_code_only,
+        "ts": int(time.time()),
+    }
 
 
 @app.get("/billing/status")
@@ -1039,71 +1218,37 @@ def generate(body: GenerateReq, authorization: str = Header(default="")):
             raise e
         raise HTTPException(status_code=500, detail=f"openai_error: {str(e)}")
 
-    raw_out = json.dumps(candidate, ensure_ascii=True)
+    return _build_generation_success_response(candidate, user_prompt, uid, is_pro, used_free)
 
-    obj = _extract_json_obj(raw_out)
 
-    ea_name = ""
-    ea_info = ""
-    recommended_params = ""
-    ea_code_only = ""
+@app.post("/improve")
+def improve(body: ImproveReq, authorization: str = Header(default="")):
+    decoded = verify_user(authorization)
+    uid = decoded.get("uid") or "unknown"
+    email = decoded.get("email")
 
-    if obj and isinstance(obj, dict):
-        # 内側JSONを優先採用（今回の症状対策の本丸）
-        obj2 = _unwrap_inner_json_if_needed(obj)
+    state = _get_or_create_user_state(uid, email)
+    is_pro = bool(state.get("is_pro"))
+    used_free = int(state.get("free_generate_count") or 0)
+    remaining = _remaining_from_state(state)
 
-        if not _has_required_keys(obj2):
-            # JSONは取れたが形式が崩れている場合は失敗扱い（生JSONをea_codeにしない）
-            raise HTTPException(status_code=500, detail="invalid model json shape")
+    if (not is_pro) and remaining <= 0:
+        raise HTTPException(status_code=403, detail="free limit reached")
 
-        ea_name = _sanitize_ea_name(str(obj2.get("ea_name") or ""))
-        ea_info = _normalize_ea_info(obj2.get("ea_info") or "")
-        recommended_params = _normalize_recommended_params(obj2.get("recommended_params") or "")
+    instruction = (body.instruction or "").strip()
+    existing_code = str(body.existing_code or "").strip()
+    compiler_errors = str(body.compiler_errors or "").strip()
+    platform = str(body.platform or "").strip()
 
-        ea_code_val = obj2.get("ea_code")
-        ea_code_only = _ensure_ascii_only(str(ea_code_val or "").strip())
+    if not existing_code:
+        raise HTTPException(status_code=422, detail="existing_code is required")
 
-        # 最後の保険: ea_codeがJSONっぽいなら弾く
-        s = ea_code_only.lstrip()
-        if s.startswith("{") and ('"ea_code"' in s or '"ea_name"' in s):
-            raise HTTPException(status_code=500, detail="ea_code contains json (refused)")
+    try:
+        candidate = _generate_validated_improved_ea(instruction, existing_code, compiler_errors, platform)
+    except Exception as e:
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(status_code=500, detail=f"openai_error: {str(e)}")
 
-        if not ea_name or ea_name == "EA":
-            ea_name = generate_ea_name(user_prompt, ea_code_only)
-
-    else:
-        # JSON抽出に失敗した場合は「コードっぽい」時だけ救済する
-        if _looks_like_mql_code(raw_out):
-            ea_code_only = _ensure_ascii_only(raw_out)
-            ea_name = generate_ea_name(user_prompt, ea_code_only)
-            ea_info = ""
-            recommended_params = ""
-        else:
-            # ここで raw_out を ea_code に入れると、今回の「全部コード表示」事故になる
-            raise HTTPException(status_code=500, detail="failed to parse model output as json")
-
-    if not ea_code_only:
-        raise HTTPException(status_code=500, detail="failed to obtain ea_code")
-
-    if is_pro:
-        used = used_free
-        remaining = 999999
-    else:
-        used, remaining = _increment_free_count(uid)
-
-    preview = ea_code_only[:300].replace("\r\n", "\n")
-
-    return {
-        "ok": True,
-        "uid": uid,
-        "used": used,
-        "remaining": remaining,
-        "model": MODEL,
-        "received_prompt_len": len(user_prompt),
-        "preview": preview,
-        "ea_name": ea_name,
-        "ea_info": ea_info,
-        "recommended_params": recommended_params,
-        "ea_code": ea_code_only,
-        "ts": int(time.time()),
-    }
+    success_prompt = instruction or compiler_errors or existing_code[:500]
+    return _build_generation_success_response(candidate, success_prompt, uid, is_pro, used_free)
