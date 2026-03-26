@@ -1066,6 +1066,42 @@ def _collect_context_alignment_issues(src: str, context_text: str) -> list[str]:
     return issues
 
 
+def _is_blocking_issue(issue: str) -> bool:
+    text = (issue or "").strip()
+    if not text:
+        return False
+
+    non_blocking_prefixes = [
+        "Trading EA should declare and use a MagicNumber",
+        "Position management selects symbol positions but does not filter by POSITION_MAGIC.",
+        "Entry gating blocks on any open position for the symbol.",
+        "History-based loss tracking uses deal history without filtering by DEAL_MAGIC.",
+        "Pip-style parameters are used without an explicit pip conversion helper",
+        "Spread logic appears to compare points against a '*Pips' threshold without pip conversion.",
+        "Signal logic mixes current-bar indicator values with previous closed-bar candle data.",
+        "Check CopyBuffer return values before using indicator buffers",
+        "Open-position management runs only after the new-bar gate.",
+        "Loss cooldown logic may reset every bar and prevent trading from ever resuming.",
+        "Hard-coded symbol validation can make OnInit fail on broker suffixes/prefixes or a mistyped pair string.",
+        "Hard-coded symbol literal '",
+        "Hard-coded symbol checks do not match the requested pair",
+        "MaxSpreadPips is extremely tight for an exotic, metal, crypto, or index-style symbol",
+        "The request mentions swap or carry, but the code contains no explicit swap-related logic.",
+        "The request is sell-only, but the code still contains a buy entry.",
+        "The request is buy-only, but the code still contains a sell entry.",
+        "Remove unused input parameters or implement their logic:",
+    ]
+
+    return not any(text.startswith(prefix) for prefix in non_blocking_prefixes)
+
+
+def _partition_issues(issues: list[str]) -> tuple[list[str], list[str]]:
+    deduped = _dedupe_keep_order(issues)
+    blocking = [item for item in deduped if _is_blocking_issue(item)]
+    advisory = [item for item in deduped if not _is_blocking_issue(item)]
+    return blocking, advisory
+
+
 def _collect_static_issues(code: str, platform: str) -> list[str]:
     issues: list[str] = []
     src = (code or "").strip()
@@ -1268,6 +1304,7 @@ def _generate_validated_ea(user_prompt: str) -> dict[str, str]:
     raw_out = ""
     parsed: Optional[dict[str, str]] = None
     issues: list[str] = []
+    blocking_issues: list[str] = []
 
     for attempt in range(MAX_GENERATION_PASSES):
         if attempt == 0:
@@ -1288,15 +1325,17 @@ def _generate_validated_ea(user_prompt: str) -> dict[str, str]:
         except ValueError as e:
             parsed = None
             issues = [str(e)]
+            blocking_issues = list(issues)
             continue
 
         issues = _collect_static_issues(parsed.get("ea_code") or "", platform)
         issues.extend(_collect_context_alignment_issues(parsed.get("ea_code") or "", user_prompt))
-        issues = _dedupe_keep_order(issues)[:STATIC_ISSUE_LIMIT]
-        if not issues:
+        blocking_issues, advisory_issues = _partition_issues(issues)
+        issues = (blocking_issues + advisory_issues)[:STATIC_ISSUE_LIMIT]
+        if not blocking_issues:
             return parsed
 
-    detail = "; ".join(issues) if issues else "validation failed"
+    detail = "; ".join(blocking_issues or issues) if (blocking_issues or issues) else "validation failed"
     raise HTTPException(status_code=500, detail=f"generation_validation_failed: {detail}")
 
 
@@ -1314,6 +1353,7 @@ def _generate_validated_improved_ea(
     raw_out = ""
     parsed: Optional[dict[str, str]] = None
     issues: list[str] = []
+    blocking_issues: list[str] = []
 
     for attempt in range(MAX_GENERATION_PASSES):
         if attempt == 0:
@@ -1337,15 +1377,17 @@ def _generate_validated_improved_ea(
         except ValueError as e:
             parsed = None
             issues = [str(e)]
+            blocking_issues = list(issues)
             continue
 
         issues = _collect_static_issues(parsed.get("ea_code") or "", platform)
         issues.extend(_collect_context_alignment_issues(parsed.get("ea_code") or "", instruction))
-        issues = _dedupe_keep_order(issues)[:STATIC_ISSUE_LIMIT]
-        if not issues:
+        blocking_issues, advisory_issues = _partition_issues(issues)
+        issues = (blocking_issues + advisory_issues)[:STATIC_ISSUE_LIMIT]
+        if not blocking_issues:
             return parsed
 
-    detail = "; ".join(issues) if issues else "validation failed"
+    detail = "; ".join(blocking_issues or issues) if (blocking_issues or issues) else "validation failed"
     raise HTTPException(status_code=500, detail=f"improve_validation_failed: {detail}")
 
 
