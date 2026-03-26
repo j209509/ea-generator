@@ -164,6 +164,11 @@ def build_system_prompt(platform: str) -> str:
         "- no unused variables if they would create warnings\n"
         "- balanced braces, parentheses, and brackets\n"
         "- complete event handlers and helper functions\n"
+        "- the EA must still be capable of placing trades under plausible market conditions\n"
+        "- prefer one clear, reachable entry setup over too many stacked filters\n"
+        "- use consistent bar indexing for signals; closed-bar logic should use the same index for price and indicators\n"
+        "- if values are described in pips, implement explicit pip-to-price / pip-to-point conversion for 3/5-digit symbols\n"
+        "- do not declare dormant inputs or safety features unless they are actually implemented\n"
         "Prefer a simpler but cleaner EA over a complex EA with compile risk.\n"
         f"{_platform_prompt_rules(platform)}"
         "If output becomes long, shorten ea_info/recommended_params, but NEVER omit ea_code.\n"
@@ -173,12 +178,17 @@ def build_system_prompt(platform: str) -> str:
 def build_repair_system_prompt(platform: str) -> str:
     return (
         "You repair MetaTrader EA source code so it becomes structurally compile-safe.\n"
+        "It must also remain capable of opening trades under plausible market conditions.\n"
         "Return ONLY valid JSON with exactly these 4 keys: ea_name, ea_info, recommended_params, ea_code.\n"
         "- ea_name: ASCII only (letters/digits/_/-), no spaces, 8-32 chars.\n"
         "- ea_info: Japanese, <= 400 characters.\n"
         "- recommended_params: Japanese. Up to 5 lines. Each line format: 'Name: Range (short note)'.\n"
         "- ea_code: FULL EA source code ONLY, ASCII only inside ea_code.\n"
         "Preserve the original trading intent, but simplify aggressively if needed to remove compile risk.\n"
+        "If the logic looks overfiltered or internally inconsistent, simplify it so a realistic signal can actually trigger.\n"
+        "Use explicit pip conversion helpers when the code exposes pip-based inputs.\n"
+        "Use consistent bar indexing for price and indicator signals.\n"
+        "Remove or implement unused inputs such as time-exit or cooldown settings.\n"
         "If ea_info or recommended_params are in English, rewrite them into natural Japanese before returning.\n"
         "Never output markdown, explanations, or code fences.\n"
         f"{_platform_prompt_rules(platform)}"
@@ -189,6 +199,7 @@ def build_improve_system_prompt(platform: str) -> str:
     return (
         "You improve an existing MetaTrader EA source code file.\n"
         "You will receive the current EA code, the user's requested changes, and optionally compiler errors.\n"
+        "The improved EA must not only compile; it must also remain realistically tradable.\n"
         "Return ONLY valid JSON with exactly these 4 keys: ea_name, ea_info, recommended_params, ea_code.\n"
         "- ea_name: ASCII only (letters/digits/_/-), no spaces, 8-32 chars.\n"
         "- ea_info: Japanese, <= 400 characters.\n"
@@ -196,6 +207,10 @@ def build_improve_system_prompt(platform: str) -> str:
         "- Preserve the original strategy intent unless the user explicitly asks to change it.\n"
         "- Fix compiler problems first when error logs are provided.\n"
         "- Modify only what is necessary; keep working parts stable when reasonable.\n"
+        "- If the current entry logic looks too restrictive to trigger, simplify it instead of preserving broken complexity.\n"
+        "- Keep bar references consistent; closed-bar signals should use the same bar index for price and indicators.\n"
+        "- Use explicit pip conversion helpers when pip-based inputs are present.\n"
+        "- Remove or implement unused inputs and dead safety logic.\n"
         "- ea_code must be the FULL source code for one file.\n"
         "- ea_code must stay ASCII only.\n"
         "- If ea_info or recommended_params are in English, rewrite them into natural Japanese.\n"
@@ -740,6 +755,83 @@ def _collect_balance_issues(code: str) -> list[str]:
     return issues
 
 
+def _collect_unused_input_issues(src: str) -> list[str]:
+    names: list[str] = []
+    for m in re.finditer(
+        r"^\s*input\s+[A-Za-z_][A-Za-z0-9_]*\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:=|;)",
+        src,
+        flags=re.MULTILINE,
+    ):
+        name = m.group(1)
+        if name not in names:
+            names.append(name)
+
+    unused: list[str] = []
+    for name in names:
+        if len(re.findall(rf"\b{re.escape(name)}\b", src)) <= 1:
+            unused.append(name)
+
+    if not unused:
+        return []
+
+    preview = ", ".join(unused[:4])
+    if len(unused) > 4:
+        preview += ", ..."
+    return [f"Remove unused input parameters or implement their logic: {preview}."]
+
+
+def _collect_trade_viability_issues(src: str, platform: str) -> list[str]:
+    issues: list[str] = []
+
+    if platform == "MT5":
+        has_trade_entry = bool(
+            re.search(
+                r"\b(?:trade\.(?:Buy|Sell|BuyLimit|SellLimit|BuyStop|SellStop|PositionOpen)|OrderSend)\s*\(",
+                src,
+            )
+        )
+    else:
+        has_trade_entry = bool(
+            re.search(r"\b(?:OrderSend|trade\.(?:Buy|Sell|PositionOpen))\s*\(", src)
+        )
+
+    if not has_trade_entry:
+        issues.append(
+            "No visible trade entry call was found. The EA should contain at least one reachable order-open path."
+        )
+
+    pip_names = _dedupe_keep_order(re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*Pips)\b", src))
+    has_pip_helper = bool(
+        re.search(r"\b(?:PipSize|PipsToPrice|PipsToPoints|PointsPerPip|PipPoint|PipValue)\b", src)
+    )
+    if pip_names and "_Point" in src and not has_pip_helper:
+        preview = ", ".join(pip_names[:4])
+        if len(pip_names) > 4:
+            preview += ", ..."
+        issues.append(
+            f"Pip-style parameters are used without an explicit pip conversion helper for 3/5-digit symbols: {preview}."
+        )
+
+    if re.search(r"\bspread[A-Za-z0-9_]*\s*=.*?/_Point", src, flags=re.IGNORECASE | re.DOTALL) and re.search(
+        r"\bspread[A-Za-z0-9_]*\b.*?(?:<=|<|>=|>)\s*[A-Za-z_][A-Za-z0-9_]*Pips\b",
+        src,
+        flags=re.IGNORECASE | re.DOTALL,
+    ):
+        issues.append(
+            "Spread logic appears to compare points against a '*Pips' threshold without pip conversion."
+        )
+
+    if re.search(r"CopyBuffer\s*\([^,\n]+,\s*0,\s*0,\s*1\s*,", src) and re.search(
+        r"\bi(?:Open|Close|High|Low)\s*\([^,\n]+,\s*[^,\n]+,\s*1\s*\)",
+        src,
+    ):
+        issues.append(
+            "Signal logic mixes current-bar indicator values with previous closed-bar candle data. Use a consistent closed-bar index."
+        )
+
+    return issues
+
+
 def _collect_static_issues(code: str, platform: str) -> list[str]:
     issues: list[str] = []
     src = (code or "").strip()
@@ -790,6 +882,9 @@ def _collect_static_issues(code: str, platform: str) -> list[str]:
             issues.append("MT4 code uses MT5 CTrade helper methods.")
         if "CopyBuffer(" in src:
             issues.append("MT4 code uses CopyBuffer, which is a common source of MT5-style mixed code.")
+
+    issues.extend(_collect_trade_viability_issues(src, platform))
+    issues.extend(_collect_unused_input_issues(src))
 
     return _dedupe_keep_order(issues)[:STATIC_ISSUE_LIMIT]
 
