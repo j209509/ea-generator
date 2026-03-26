@@ -213,7 +213,11 @@ def build_system_prompt(platform: str) -> str:
         "- balanced braces, parentheses, and brackets\n"
         "- complete event handlers and helper functions\n"
         "- the EA must still be capable of placing trades under plausible market conditions\n"
+        "- for the first version, prefer defaults that produce several trades in a normal backtest; too many trades is better than zero trades\n"
         "- prefer one clear, reachable entry setup over too many stacked filters\n"
+        "- unless the user explicitly asks for rare or strict entries, keep default thresholds permissive rather than extreme\n"
+        "- avoid combining many filters such as long higher-timeframe trend, extreme RSI, band touch, candle pattern, and narrow session all at once\n"
+        "- if swap/carry or session filters are used, keep the remaining entry logic simple enough that trades still occur\n"
         "- use consistent bar indexing for signals; closed-bar logic should use the same index for price and indicators\n"
         "- if values are described in pips, implement explicit pip-to-price / pip-to-point conversion for 3/5-digit symbols\n"
         "- every CopyBuffer call must validate its return value before the buffer values are used\n"
@@ -242,6 +246,9 @@ def build_repair_system_prompt(platform: str) -> str:
         "- ea_code: FULL EA source code ONLY, ASCII only inside ea_code.\n"
         "Preserve the original trading intent, but simplify aggressively if needed to remove compile risk.\n"
         "If the logic looks overfiltered or internally inconsistent, simplify it so a realistic signal can actually trigger.\n"
+        "For the first version, prefer defaults that produce several trades in a normal backtest; too many trades is better than zero trades.\n"
+        "Unless the user explicitly asks for rare or strict entries, keep thresholds permissive rather than extreme.\n"
+        "Avoid stacking too many filters such as long higher-timeframe trend, extreme RSI, band touch, candle pattern, and narrow session all at once.\n"
         "Use explicit pip conversion helpers when the code exposes pip-based inputs.\n"
         "Use consistent bar indexing for price and indicator signals.\n"
         "Validate every CopyBuffer call before using indicator values.\n"
@@ -272,6 +279,9 @@ def build_improve_system_prompt(platform: str) -> str:
         "- Fix compiler problems first when error logs are provided.\n"
         "- Modify only what is necessary; keep working parts stable when reasonable.\n"
         "- If the current entry logic looks too restrictive to trigger, simplify it instead of preserving broken complexity.\n"
+        "- For the first version, prefer defaults that produce several trades in a normal backtest; too many trades is better than zero trades.\n"
+        "- Unless the user explicitly asks for rare or strict entries, keep thresholds permissive rather than extreme.\n"
+        "- Avoid stacking too many filters such as long higher-timeframe trend, extreme RSI, band touch, candle pattern, and narrow session all at once.\n"
         "- Keep bar references consistent; closed-bar signals should use the same bar index for price and indicators.\n"
         "- Use explicit pip conversion helpers when pip-based inputs are present.\n"
         "- Validate every CopyBuffer call before using indicator values.\n"
@@ -1066,6 +1076,80 @@ def _collect_context_alignment_issues(src: str, context_text: str) -> list[str]:
     return issues
 
 
+def _collect_trade_frequency_issues(src: str, context_text: str) -> list[str]:
+    issues: list[str] = []
+    ctx = str(context_text or "")
+    if re.search(r"厳し|厳密|慎重|レア|少なめ|高精度|高勝率|strict|rare|selective|few trades", ctx, flags=re.IGNORECASE):
+        return issues
+
+    cond_names = _dedupe_keep_order(re.findall(r"\bbool\s+(cond\d+)\s*=", src))
+    if len(cond_names) >= 4:
+        issues.append(
+            "Entry logic stacks four or more simultaneous conditions. For the first version, reduce default filters so backtests produce several trades."
+        )
+
+    rsi_inputs = re.findall(
+        r"^\s*input\s+double\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([0-9]+(?:\.[0-9]+)?)",
+        src,
+        flags=re.MULTILINE,
+    )
+    for name, raw_value in rsi_inputs:
+        if "RSI" not in name.upper():
+            continue
+        try:
+            value = float(raw_value)
+        except Exception:
+            continue
+
+        upper_name = name.upper()
+        if ("SELL" in upper_name or "OVERBOUGHT" in upper_name) and value >= 68.0:
+            issues.append(
+                "Default RSI sell threshold is very extreme. For the first version, start with a looser threshold so trades occur more often."
+            )
+            break
+        if ("BUY" in upper_name or "OVERSOLD" in upper_name) and value <= 32.0:
+            issues.append(
+                "Default RSI buy threshold is very extreme. For the first version, start with a looser threshold so trades occur more often."
+            )
+            break
+
+    if (
+        re.search(r"\biMA\s*\([^,\n]+,\s*PERIOD_(?:H4|D1)\s*,\s*(?:1[5-9]\d|[2-9]\d{2,})", src)
+        and "iRSI(" in src
+        and "iBands(" in src
+        and len(cond_names) >= 4
+    ):
+        issues.append(
+            "Default entry logic combines a long higher-timeframe MA filter with RSI, Bollinger, and candle filters. This is likely too restrictive for a first-pass EA."
+        )
+
+    blocked_hours = None
+    blocked_match = re.search(
+        r"tm\.hour\s*>=\s*(\d{1,2})\s*&&\s*tm\.hour\s*<\s*(\d{1,2})\s*\)\s*return\s+false\s*;",
+        src,
+    )
+    if blocked_match:
+        start = int(blocked_match.group(1))
+        end = int(blocked_match.group(2))
+        blocked_hours = end - start if end > start else (24 - start + end)
+        if blocked_hours >= 12:
+            issues.append(
+                "Time filter blocks at least half of the day. For the first version, widen the trading window unless the user explicitly requests a narrow session."
+            )
+
+    if (
+        ("SYMBOL_SWAP_SHORT" in src or "SYMBOL_SWAP_LONG" in src)
+        and len(cond_names) >= 4
+        and blocked_hours is not None
+        and blocked_hours >= 12
+    ):
+        issues.append(
+            "Swap/carry logic is combined with a narrow time window and many extra filters, which may reduce trades too much for a first-pass EA."
+        )
+
+    return _dedupe_keep_order(issues)
+
+
 def _is_blocking_issue(issue: str) -> bool:
     text = (issue or "").strip()
     if not text:
@@ -1090,6 +1174,12 @@ def _is_blocking_issue(issue: str) -> bool:
         "The request is sell-only, but the code still contains a buy entry.",
         "The request is buy-only, but the code still contains a sell entry.",
         "Remove unused input parameters or implement their logic:",
+        "Entry logic stacks four or more simultaneous conditions.",
+        "Default RSI sell threshold is very extreme.",
+        "Default RSI buy threshold is very extreme.",
+        "Default entry logic combines a long higher-timeframe MA filter",
+        "Time filter blocks at least half of the day.",
+        "Swap/carry logic is combined with a narrow time window and many extra filters",
     ]
 
     return not any(text.startswith(prefix) for prefix in non_blocking_prefixes)
@@ -1219,6 +1309,7 @@ def _build_repair_user_prompt(
         "Return a FULL corrected JSON object with exactly these 4 keys: ea_name, ea_info, recommended_params, ea_code.\n"
         "The result must be safer to compile than the current candidate.\n"
         "Preserve the strategy intent, but delete or simplify risky code if needed.\n"
+        "If the listed problems indicate zero-trade risk, loosen the default thresholds so the first version produces several trades.\n"
         "ea_info and recommended_params must be natural Japanese.\n"
         "No markdown. No explanation.\n"
     )
@@ -1253,6 +1344,7 @@ def _build_improve_user_prompt(
             "",
             "Return a FULL corrected JSON object with exactly these 4 keys: ea_name, ea_info, recommended_params, ea_code.",
             "Keep the behavior close to the original EA unless the request says otherwise.",
+            "If the listed problems indicate zero-trade risk, loosen the default thresholds so the first version produces several trades.",
             "ea_info and recommended_params must be natural Japanese.",
             "No markdown. No explanation.",
         ]
@@ -1293,6 +1385,7 @@ def _build_improve_repair_user_prompt(
             "",
             "Return a FULL corrected JSON object with exactly these 4 keys: ea_name, ea_info, recommended_params, ea_code.",
             "Keep the behavior close to the original EA unless the request says otherwise.",
+            "If the listed problems indicate zero-trade risk, loosen the default thresholds so the first version produces several trades.",
             "No markdown. No explanation.",
         ]
     )
@@ -1330,9 +1423,13 @@ def _generate_validated_ea(user_prompt: str) -> dict[str, str]:
 
         issues = _collect_static_issues(parsed.get("ea_code") or "", platform)
         issues.extend(_collect_context_alignment_issues(parsed.get("ea_code") or "", user_prompt))
+        issues.extend(_collect_trade_frequency_issues(parsed.get("ea_code") or "", user_prompt))
         blocking_issues, advisory_issues = _partition_issues(issues)
         issues = (blocking_issues + advisory_issues)[:STATIC_ISSUE_LIMIT]
         if not blocking_issues:
+            if advisory_issues and attempt < (MAX_GENERATION_PASSES - 1):
+                issues = advisory_issues[:STATIC_ISSUE_LIMIT]
+                continue
             return parsed
 
     detail = "; ".join(blocking_issues or issues) if (blocking_issues or issues) else "validation failed"
@@ -1382,9 +1479,13 @@ def _generate_validated_improved_ea(
 
         issues = _collect_static_issues(parsed.get("ea_code") or "", platform)
         issues.extend(_collect_context_alignment_issues(parsed.get("ea_code") or "", instruction))
+        issues.extend(_collect_trade_frequency_issues(parsed.get("ea_code") or "", instruction))
         blocking_issues, advisory_issues = _partition_issues(issues)
         issues = (blocking_issues + advisory_issues)[:STATIC_ISSUE_LIMIT]
         if not blocking_issues:
+            if advisory_issues and attempt < (MAX_GENERATION_PASSES - 1):
+                issues = advisory_issues[:STATIC_ISSUE_LIMIT]
+                continue
             return parsed
 
     detail = "; ".join(blocking_issues or issues) if (blocking_issues or issues) else "validation failed"
