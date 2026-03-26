@@ -230,6 +230,9 @@ def build_system_prompt(platform: str) -> str:
         "- if symbol restriction is needed, prefer the chart symbol or a permissive match based on the requested pair; never invent invalid 6-letter pair codes\n"
         "- loss cooldown logic must start only when a new losing-streak threshold is reached; it must not reset every bar from the same historical losses\n"
         "- do not declare dormant inputs or safety features unless they are actually implemented\n"
+        "- if risk-based lot sizing is requested, declare a RiskPercent input and use it directly in the riskMoney calculation instead of any hardcoded literal\n"
+        "- if stop distance is represented as sl_points = price_distance / _Point, the money value of one point per 1 lot must be tick_value * (_Point / tick_size), or an exactly equivalent formula\n"
+        "- never use tick_value / tick_size by itself together with sl_points, because that makes lot size wrong by a factor of _Point and can pin volume at the broker minimum\n"
         "Prefer a simpler but cleaner EA over a complex EA with compile risk.\n"
         f"{_platform_prompt_rules(platform)}"
         "If output becomes long, shorten ea_info/recommended_params, but NEVER omit ea_code.\n"
@@ -264,6 +267,9 @@ def build_repair_system_prompt(platform: str) -> str:
         "Never invent invalid 6-letter pair codes when restricting the symbol.\n"
         "Loss cooldown logic must not be reset every bar from the same historical loss streak.\n"
         "Remove or implement unused inputs such as time-exit or cooldown settings.\n"
+        "If risk-based lot sizing is present, RiskPercent must be an input and riskMoney must reference RiskPercent directly.\n"
+        "If stop distance is stored as sl_points = price_distance / _Point, compute the one-point value per lot as tick_value * (_Point / tick_size), or an exactly equivalent formula.\n"
+        "Do not use tick_value / tick_size by itself when multiplying by sl_points.\n"
         "If ea_info or recommended_params are in English, rewrite them into natural Japanese before returning.\n"
         "Never output markdown, explanations, or code fences.\n"
         f"{_platform_prompt_rules(platform)}"
@@ -286,6 +292,9 @@ def build_improve_system_prompt(platform: str) -> str:
         "- If the request is only to change fixed lot sizing into risk-percent sizing, change only money-management code and the minimum required inputs.\n"
         "- For a risk-sizing-only request, do not modify entry logic, exit logic, time filters, spread filters, symbol guards, position counting, or position management.\n"
         "- Risk-based lot sizing must round by SYMBOL_VOLUME_STEP precision, clamp to broker min/max volume, and avoid zero-lot fallbacks that silently stop all trading.\n"
+        "- Risk-based lot sizing must use RiskPercent directly in the riskMoney calculation instead of a hardcoded literal.\n"
+        "- If stop distance is represented as sl_points = price_distance / _Point, the one-point value per 1 lot must be tick_value * (_Point / tick_size), or an exactly equivalent formula.\n"
+        "- Do not use tick_value / tick_size by itself when multiplying by sl_points.\n"
         "- Do not silently optimize, simplify, or redesign the strategy just because another structure looks cleaner.\n"
         "- Fix compiler problems first when error logs are provided.\n"
         "- Modify only what is necessary; keep working parts stable when reasonable.\n"
@@ -1103,6 +1112,8 @@ def _collect_context_alignment_issues(src: str, context_text: str) -> list[str]:
         if re.search(r"\btrade\.Sell\s*\(", src):
             issues.append("The request is buy-only, but the code still contains a sell entry.")
 
+    issues.extend(_collect_requested_risk_sizing_issues(src, context_text))
+
     return issues
 
 
@@ -1189,6 +1200,59 @@ def _request_mentions_trade_frequency_change(text: str) -> bool:
             flags=re.IGNORECASE,
         )
     )
+
+
+def _request_mentions_risk_sizing(text: str) -> bool:
+    t = str(text or "")
+    return bool(
+        re.search(
+            r"risk\s*%|risk percent|riskpercent|fixed\s*lot|fixedlot|lot size|money management|position size|繝ｭ繝・ヨ|蝗ｺ螳壹Ο繝・ヨ|繝ｪ繧ｹ繧ｯ|リスク|ロット",
+            t,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def _collect_requested_risk_sizing_issues(src: str, context_text: str) -> list[str]:
+    issues: list[str] = []
+    code = str(src or "")
+    context = str(context_text or "")
+
+    requested = _request_mentions_risk_sizing(context)
+    code_looks_risk_based = any(token in code for token in ["RiskPercent", "LotByRisk", "CalculateLot", "CalcLot", "riskMoney"])
+    if not requested and not code_looks_risk_based:
+        return issues
+
+    risk_money_match = re.search(r"\briskMoney\s*=\s*([^;]+);", code, flags=re.IGNORECASE)
+
+    if requested and "RiskPercent" not in code:
+        issues.append("Risk-based lot sizing was requested, but the code does not expose a RiskPercent input.")
+
+    if risk_money_match:
+        if "RiskPercent" not in risk_money_match.group(1):
+            issues.append("Risk-based lot sizing does not use RiskPercent in the riskMoney calculation.")
+    elif requested and "RiskPercent" in code:
+        issues.append("RiskPercent exists, but the lot-sizing code does not clearly calculate riskMoney from it.")
+
+    if re.search(r"\bsl_points\s*=\s*[^;\n]+/\s*_Point\b", code, flags=re.IGNORECASE):
+        point_value_expr = ""
+        for var_name in ("value_per_point", "money_per_point", "point_value", "loss_per_point"):
+            match = re.search(rf"\b{var_name}\s*=\s*([^;]+);", code, flags=re.IGNORECASE)
+            if match:
+                point_value_expr = match.group(1)
+                break
+
+        if point_value_expr:
+            if re.search(r"\btick_val\s*/\s*tick_size\b", point_value_expr, flags=re.IGNORECASE) and "_Point" not in point_value_expr:
+                issues.append(
+                    "Risk-based lot sizing uses tick_val / tick_size with sl_points but misses the _Point factor, so lot size can stick to the broker minimum."
+                )
+        elif re.search(r"\btick_val\s*/\s*tick_size\b", code, flags=re.IGNORECASE) and "_Point" not in code:
+            issues.append(
+                "Risk-based lot sizing appears to use tick_val / tick_size with sl_points and no visible _Point factor."
+            )
+
+    return _dedupe_keep_order(issues)
 
 
 def _request_is_risk_only_change(text: str) -> bool:
