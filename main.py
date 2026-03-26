@@ -283,6 +283,9 @@ def build_improve_system_prompt(platform: str) -> str:
         "- Strongly preserve the current strategy logic. Do not remove, replace, or rewrite existing logic unless the user explicitly asks for that change or a concrete bug requires it.\n"
         "- Keep the original indicator set, entry direction, entry conditions, exit conditions, timeframe assumptions, and risk model as unchanged as possible.\n"
         "- If the request is only a compile fix or small behavior fix, make the minimum possible edit.\n"
+        "- If the request is only to change fixed lot sizing into risk-percent sizing, change only money-management code and the minimum required inputs.\n"
+        "- For a risk-sizing-only request, do not modify entry logic, exit logic, time filters, spread filters, symbol guards, position counting, or position management.\n"
+        "- Risk-based lot sizing must round by SYMBOL_VOLUME_STEP precision, clamp to broker min/max volume, and avoid zero-lot fallbacks that silently stop all trading.\n"
         "- Do not silently optimize, simplify, or redesign the strategy just because another structure looks cleaner.\n"
         "- Fix compiler problems first when error logs are provided.\n"
         "- Modify only what is necessary; keep working parts stable when reasonable.\n"
@@ -1188,6 +1191,154 @@ def _request_mentions_trade_frequency_change(text: str) -> bool:
     )
 
 
+def _request_is_risk_only_change(text: str) -> bool:
+    t = str(text or "").strip()
+    if not t:
+        return False
+    if "RISK_MODEL_ONLY" in t.upper():
+        return True
+    if len(t) > 220:
+        return False
+    if not re.search(
+        r"risk\s*%|risk percent|riskpercent|fixed\s*lot|fixedlot|lot size|money management|ロット|固定ロット|リスク|パーセント|資金管理",
+        t,
+        flags=re.IGNORECASE,
+    ):
+        return False
+    return not re.search(
+        r"rsi|ema|sma|macd|bollinger|bb|atr|entry|exit|take profit|stop loss|tp|sl|trail|trailing|breakeven|session|spread|indicator|strategy|logic|condition|エントリー|決済|利確|損切|トレーリング|ブレイクイーブン|時間足|時間帯|スプレッド|インジケーター|条件|ロジック",
+        t,
+        flags=re.IGNORECASE,
+    )
+
+
+def _extract_named_function_block(src: str, name: str) -> str:
+    pattern = rf"\b(?:bool|int|void|double|float|long|ulong|datetime|string|char)\s+{re.escape(name)}\s*\([^)]*\)\s*\{{"
+    match = re.search(pattern, src)
+    if not match:
+        return ""
+
+    open_brace = src.find("{", match.end() - 1)
+    if open_brace < 0:
+        return ""
+
+    in_line_comment = False
+    in_block_comment = False
+    in_string = ""
+    escaped = False
+    depth = 0
+
+    for idx in range(open_brace, len(src)):
+        ch = src[idx]
+        nxt = src[idx + 1] if idx + 1 < len(src) else ""
+
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+            continue
+
+        if in_block_comment:
+            if ch == "*" and nxt == "/":
+                in_block_comment = False
+            continue
+
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == in_string:
+                in_string = ""
+            continue
+
+        if ch == "/" and nxt == "/":
+            in_line_comment = True
+            continue
+        if ch == "/" and nxt == "*":
+            in_block_comment = True
+            continue
+        if ch in ("'", '"'):
+            in_string = ch
+            continue
+
+        if ch == "{":
+            depth += 1
+            continue
+        if ch == "}":
+            depth -= 1
+            if depth == 0:
+                return src[match.start() : idx + 1]
+
+    return ""
+
+
+def _normalize_risk_only_preserved_block(block: str) -> str:
+    if not block:
+        return ""
+
+    risk_line = re.compile(
+        r"\b(?:FixedLot|RiskPercent|RiskPct|LotByRisk|CalcLot|CalculateLot|LotSize|riskMoney|tick_val|tick_size|value_per_point|minlot|maxlot|lotstep|SYMBOL_VOLUME_|SYMBOL_TRADE_TICK_|ACCOUNT_BALANCE|NormalizeDouble)\b|if\s*\(\s*lot\s*<=\s*0\s*\)\s*return\s*;|\blot\s*=",
+        flags=re.IGNORECASE,
+    )
+
+    normalized: list[str] = []
+    for raw in block.splitlines():
+        line = re.sub(r"//.*", "", raw).strip()
+        if not line:
+            continue
+        if risk_line.search(line):
+            continue
+        normalized.append(re.sub(r"\s+", "", line))
+    return "\n".join(normalized)
+
+
+def _collect_risk_only_scope_issues(existing_code: str, candidate_code: str) -> list[str]:
+    protected_functions = [
+        "IsTargetSymbol",
+        "IsNewBar",
+        "TradingTime",
+        "SpreadOK",
+        "CountPositions",
+        "ManagePosition",
+        "OnInit",
+        "OnDeinit",
+        "OnTick",
+    ]
+    issues: list[str] = []
+
+    for name in protected_functions:
+        before = _normalize_risk_only_preserved_block(_extract_named_function_block(existing_code, name))
+        after = _normalize_risk_only_preserved_block(_extract_named_function_block(candidate_code, name))
+        if before and after and before != after:
+            issues.append(
+                f"Risk-only request changed non-risk function '{name}'. Keep entry/exit/session/position logic unchanged and edit only money-management code."
+            )
+        if len(issues) >= 4:
+            break
+
+    return issues
+
+
+def _collect_risk_only_money_management_issues(code: str) -> list[str]:
+    src = str(code or "")
+    issues: list[str] = []
+
+    if "RiskPercent" not in src and "LotByRisk" not in src and "CalculateLot" not in src:
+        return issues
+
+    if re.search(r"NormalizeDouble\(\s*\w+\s*,\s*2\s*\)", src) and "SYMBOL_VOLUME_STEP" in src:
+        issues.append(
+            "Risk-based lot sizing hardcodes NormalizeDouble(..., 2). Round by the broker's SYMBOL_VOLUME_STEP precision instead."
+        )
+
+    if re.search(r"\bif\s*\(\s*lot\s*<=\s*0\s*\)\s*return\s*;", src) and len(re.findall(r"return\s+0(?:\.0+)?\s*;", src)) >= 3:
+        issues.append(
+            "Risk-based lot sizing can silently disable trading by returning zero lots on metadata failures. Use a safe broker-minimum fallback instead of zero."
+        )
+
+    return issues
+
+
 def _is_blocking_issue(issue: str) -> bool:
     text = (issue or "").strip()
     if not text:
@@ -1360,6 +1511,7 @@ def _build_improve_user_prompt(
     compiler_errors: str,
 ) -> str:
     request_text = (instruction or "").strip() or "Fix compile issues and improve the existing EA while preserving its behavior."
+    risk_only_change = _request_is_risk_only_change(request_text)
     out = [
         f"Target platform: {platform}",
         "",
@@ -1375,6 +1527,16 @@ def _build_improve_user_prompt(
                 "",
                 "Compiler error log:",
                 compiler_errors.strip(),
+            ]
+        )
+    if risk_only_change:
+        out.extend(
+            [
+                "",
+                "Change scope: RISK_MODEL_ONLY",
+                "Edit only money-management / lot-sizing code required for the requested risk-percent change.",
+                "Do not modify entry logic, exit logic, time filters, spread filters, symbol guards, position counting, or position management.",
+                "Round lots by broker volume-step precision and avoid zero-lot fallbacks that silently stop all trading.",
             ]
         )
     out.extend(
@@ -1404,6 +1566,7 @@ def _build_improve_repair_user_prompt(
     current = json.dumps(parsed, ensure_ascii=True) if parsed else raw_out
     bullet_issues = "\n".join(f"- {item}" for item in issues) if issues else "- Output is not valid yet."
     request_text = (instruction or "").strip() or "Fix compile issues and improve the existing EA while preserving its behavior."
+    risk_only_change = _request_is_risk_only_change(request_text)
     parts = [
         f"Improvement request:\n{request_text}",
         "",
@@ -1414,6 +1577,16 @@ def _build_improve_repair_user_prompt(
     ]
     if (compiler_errors or "").strip():
         parts.extend(["", "Compiler error log:", compiler_errors.strip()])
+    if risk_only_change:
+        parts.extend(
+            [
+                "",
+                "Change scope: RISK_MODEL_ONLY",
+                "Edit only money-management / lot-sizing code required for the requested risk-percent change.",
+                "Do not modify entry logic, exit logic, time filters, spread filters, symbol guards, position counting, or position management.",
+                "Round lots by broker volume-step precision and avoid zero-lot fallbacks that silently stop all trading.",
+            ]
+        )
     parts.extend(
         [
             "",
@@ -1489,6 +1662,7 @@ def _generate_validated_improved_ea(
         raise HTTPException(status_code=422, detail="existing_code is required")
 
     platform = _normalize_platform_value(str(platform_hint or ""), "", source, str(instruction or ""))
+    risk_only_change = _request_is_risk_only_change(instruction)
     raw_out = ""
     parsed: Optional[dict[str, str]] = None
     issues: list[str] = []
@@ -1521,6 +1695,9 @@ def _generate_validated_improved_ea(
 
         issues = _collect_static_issues(parsed.get("ea_code") or "", platform)
         issues.extend(_collect_context_alignment_issues(parsed.get("ea_code") or "", instruction))
+        if risk_only_change:
+            issues.extend(_collect_risk_only_scope_issues(source, parsed.get("ea_code") or ""))
+            issues.extend(_collect_risk_only_money_management_issues(parsed.get("ea_code") or ""))
         if _request_mentions_trade_frequency_change(instruction):
             issues.extend(_collect_trade_frequency_issues(parsed.get("ea_code") or "", instruction))
         blocking_issues, advisory_issues = _partition_issues(issues)
