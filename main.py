@@ -63,6 +63,54 @@ STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "").strip()
 USERS_COL = os.environ.get("USERS_COLLECTION", "users").strip() or "users"
 SHARES_COL = os.environ.get("SHARES_COLLECTION", "shared_eas").strip() or "shared_eas"
 
+KNOWN_SYMBOL_CODES = {
+    "USD",
+    "EUR",
+    "GBP",
+    "JPY",
+    "CHF",
+    "CAD",
+    "AUD",
+    "NZD",
+    "TRY",
+    "ZAR",
+    "SEK",
+    "NOK",
+    "DKK",
+    "SGD",
+    "HKD",
+    "MXN",
+    "PLN",
+    "HUF",
+    "CZK",
+    "RUB",
+    "CNH",
+    "CNY",
+    "INR",
+    "XAU",
+    "XAG",
+    "BTC",
+    "ETH",
+    "LTC",
+    "BCH",
+    "SOL",
+}
+
+KNOWN_NONFX_SYMBOLS = {
+    "NAS100",
+    "US100",
+    "US30",
+    "GER40",
+    "DE40",
+    "JP225",
+    "UK100",
+    "SPX500",
+    "BTCUSD",
+    "ETHUSD",
+    "XAUUSD",
+    "XAGUSD",
+}
+
 
 def verify_user(authorization: str) -> dict:
     if not authorization.startswith("Bearer "):
@@ -170,8 +218,12 @@ def build_system_prompt(platform: str) -> str:
         "- if values are described in pips, implement explicit pip-to-price / pip-to-point conversion for 3/5-digit symbols\n"
         "- every CopyBuffer call must validate its return value before the buffer values are used\n"
         "- if the EA places trades, declare and use a MagicNumber and filter positions/history by magic where needed\n"
+        "- if entry is blocked by existing positions, only block positions owned by this EA's MagicNumber, not every position on the symbol\n"
         "- if trailing stop, breakeven, or intrabar position management exists, manage open positions before any new-bar gate\n"
         "- if the strategy mentions swap/carry, include explicit swap-related logic instead of only naming the EA after swap\n"
+        "- avoid brittle hard-coded symbol guards that can fail OnInit because of broker suffixes/prefixes or a mistyped pair string\n"
+        "- if symbol restriction is needed, prefer the chart symbol or a permissive match based on the requested pair; never invent invalid 6-letter pair codes\n"
+        "- loss cooldown logic must start only when a new losing-streak threshold is reached; it must not reset every bar from the same historical losses\n"
         "- do not declare dormant inputs or safety features unless they are actually implemented\n"
         "Prefer a simpler but cleaner EA over a complex EA with compile risk.\n"
         f"{_platform_prompt_rules(platform)}"
@@ -194,8 +246,12 @@ def build_repair_system_prompt(platform: str) -> str:
         "Use consistent bar indexing for price and indicator signals.\n"
         "Validate every CopyBuffer call before using indicator values.\n"
         "If the EA trades, declare and use a MagicNumber and filter positions/history by magic.\n"
+        "If entry is blocked by existing positions, block only positions owned by this EA's MagicNumber.\n"
         "If trailing stop, breakeven, or intrabar exits exist, manage them before any new-bar gate.\n"
         "If the request mentions swap/carry, add explicit swap-related logic.\n"
+        "Avoid brittle symbol checks that hard-fail OnInit because of suffixes, prefixes, or mistyped pair strings.\n"
+        "Never invent invalid 6-letter pair codes when restricting the symbol.\n"
+        "Loss cooldown logic must not be reset every bar from the same historical loss streak.\n"
         "Remove or implement unused inputs such as time-exit or cooldown settings.\n"
         "If ea_info or recommended_params are in English, rewrite them into natural Japanese before returning.\n"
         "Never output markdown, explanations, or code fences.\n"
@@ -220,8 +276,12 @@ def build_improve_system_prompt(platform: str) -> str:
         "- Use explicit pip conversion helpers when pip-based inputs are present.\n"
         "- Validate every CopyBuffer call before using indicator values.\n"
         "- If the EA trades, declare and use a MagicNumber and filter positions/history by magic.\n"
+        "- If entry is blocked by existing positions, block only positions owned by this EA's MagicNumber.\n"
         "- If trailing stop, breakeven, or intrabar exits exist, manage them before any new-bar gate.\n"
         "- If the request mentions swap/carry, add explicit swap-related logic.\n"
+        "- Avoid brittle symbol checks that hard-fail OnInit because of suffixes, prefixes, or mistyped pair strings.\n"
+        "- Never invent invalid 6-letter pair codes when restricting the symbol.\n"
+        "- Loss cooldown logic must not be reset every bar from the same historical loss streak.\n"
         "- Remove or implement unused inputs and dead safety logic.\n"
         "- ea_code must be the FULL source code for one file.\n"
         "- ea_code must stay ASCII only.\n"
@@ -692,6 +752,49 @@ def _dedupe_keep_order(items: list[str]) -> list[str]:
     return out
 
 
+def _normalize_symbol_token(token: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", (token or "").upper().strip())
+
+
+def _looks_like_standard_symbol(token: str) -> bool:
+    t = _normalize_symbol_token(token)
+    if not t:
+        return False
+    if t in KNOWN_NONFX_SYMBOLS:
+        return True
+    if len(t) == 6 and t[:3] in KNOWN_SYMBOL_CODES and t[3:] in KNOWN_SYMBOL_CODES:
+        return True
+    return False
+
+
+def _extract_requested_symbols(context_text: str) -> list[str]:
+    ctx = str(context_text or "")
+    matches = re.findall(r"(?:PAIR|SYMBOL|通貨ペア)\s*[:：]\s*([A-Za-z0-9._+\-]+)", ctx, flags=re.IGNORECASE)
+    if not matches:
+        matches = re.findall(r"\b[A-Z][A-Z0-9._+\-]{4,19}\b", ctx.upper())
+
+    out: list[str] = []
+    for token in matches:
+        norm = _normalize_symbol_token(token)
+        if _looks_like_standard_symbol(norm):
+            out.append(norm)
+    return _dedupe_keep_order(out)
+
+
+def _extract_symbol_guard_literals(src: str) -> list[str]:
+    matches: list[str] = []
+    patterns = [
+        r"(?:_Symbol|Symbol\s*\(\s*\))[^;\n]{0,120}\"([A-Za-z0-9._+\-]{3,20})\"",
+        r"\"([A-Za-z0-9._+\-]{3,20})\"[^;\n]{0,120}(?:_Symbol|Symbol\s*\(\s*\))",
+    ]
+    for pattern in patterns:
+        for token in re.findall(pattern, src):
+            norm = _normalize_symbol_token(token)
+            if norm:
+                matches.append(norm)
+    return _dedupe_keep_order(matches)
+
+
 def _collect_balance_issues(code: str) -> list[str]:
     issues: list[str] = []
     stack: list[tuple[str, int]] = []
@@ -822,6 +925,11 @@ def _collect_trade_viability_issues(src: str, platform: str) -> list[str]:
             "Position management selects symbol positions but does not filter by POSITION_MAGIC."
         )
 
+    if has_trade_entry and re.search(r"\bif\s*\(\s*PositionSelect\s*\(\s*_Symbol\s*\)\s*\)\s*return\s*;", src):
+        issues.append(
+            "Entry gating blocks on any open position for the symbol. Only positions owned by this EA's MagicNumber should disable new entries."
+        )
+
     if has_trade_entry and "HistoryDealGet" in src and "DEAL_MAGIC" not in src:
         issues.append(
             "History-based loss tracking uses deal history without filtering by DEAL_MAGIC."
@@ -861,6 +969,15 @@ def _collect_trade_viability_issues(src: str, platform: str) -> list[str]:
             "Check CopyBuffer return values before using indicator buffers; standalone CopyBuffer calls can leave stale or zero data."
         )
 
+    if re.search(
+        r"\bOnInit\s*\([^)]*\)\s*\{[\s\S]{0,800}?(?:_Symbol|Symbol\s*\(\s*\))[\s\S]{0,160}?INIT_FAILED",
+        src,
+        flags=re.DOTALL,
+    ):
+        issues.append(
+            "Hard-coded symbol validation can make OnInit fail on broker suffixes/prefixes or a mistyped pair string."
+        )
+
     new_bar_pos = src.find("if(!NewBar()) return;")
     manage_pos = src.find("ManagePosition();")
     if (
@@ -872,20 +989,20 @@ def _collect_trade_viability_issues(src: str, platform: str) -> list[str]:
             "Open-position management runs only after the new-bar gate. Trailing, breakeven, and intrabar exits should usually run on every tick."
         )
 
-    cooldown_assign = re.search(
-        r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*[A-Za-z_][A-Za-z0-9_]*AfterLossBars\b",
+    cooldown_assigns = re.findall(
+        r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*[A-Za-z_][A-Za-z0-9_]*AfterLoss[A-Za-z0-9_]*\b",
         src,
     )
-    if cooldown_assign:
-        counter = cooldown_assign.group(1)
+    for counter in _dedupe_keep_order(cooldown_assigns):
         if re.search(
             rf"\bif\s*\(\s*{re.escape(counter)}\s*>\s*0\s*\)\s*\{{[^{{}}]*{re.escape(counter)}\s*--[^{{}}]*return\s*;",
             src,
             flags=re.DOTALL,
-        ):
+        ) and re.search(r"\bconsecutiveLoss\b", src):
             issues.append(
                 "Loss cooldown logic may reset every bar and prevent trading from ever resuming. Start the cooldown only when the threshold is newly reached."
             )
+            break
 
     return issues
 
@@ -893,6 +1010,24 @@ def _collect_trade_viability_issues(src: str, platform: str) -> list[str]:
 def _collect_context_alignment_issues(src: str, context_text: str) -> list[str]:
     issues: list[str] = []
     ctx = (context_text or "").upper()
+    requested_symbols = _extract_requested_symbols(context_text or "")
+    guard_literals = _extract_symbol_guard_literals(src)
+
+    for literal in guard_literals:
+        if len(literal) == 6 and not _looks_like_standard_symbol(literal):
+            issues.append(
+                f"Hard-coded symbol literal '{literal}' does not look like a standard tradable pair code."
+            )
+
+    if requested_symbols and guard_literals:
+        mismatched: list[str] = []
+        for literal in guard_literals:
+            if not any(expected in literal or literal in expected for expected in requested_symbols):
+                mismatched.append(literal)
+        if mismatched:
+            issues.append(
+                "Hard-coded symbol checks do not match the requested pair and may stop the EA from starting or trading."
+            )
 
     if any(token in ctx for token in ["USDTRY", "EURTRY", "GBPTRY", "TRY", "XAU", "GOLD", "XAG", "SILVER", "BTC", "ETH", "NAS100", "US30", "GER40", "JP225"]):
         m = re.search(
