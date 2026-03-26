@@ -129,6 +129,7 @@ class GenerateReq(BaseModel):
 class ImproveReq(BaseModel):
     instruction: str = ""
     existing_code: str = ""
+    existing_filename: str = ""
     compiler_errors: str = ""
     platform: str = ""
 
@@ -245,7 +246,10 @@ def build_repair_system_prompt(platform: str) -> str:
         "- recommended_params: Japanese. Up to 5 lines. Each line format: 'Name: Range (short note)'.\n"
         "- ea_code: FULL EA source code ONLY, ASCII only inside ea_code.\n"
         "Preserve the original trading intent, but simplify aggressively if needed to remove compile risk.\n"
-        "If the logic looks overfiltered or internally inconsistent, simplify it so a realistic signal can actually trigger.\n"
+        "When repairing an existing EA, do not remove, replace, or redesign working strategy logic unless the user explicitly requests it or a concrete bug requires it.\n"
+        "Keep the original indicator set, entry direction, entry logic, exit logic, timeframe assumptions, and risk model as unchanged as possible.\n"
+        "If only a small fix is requested, make only a small fix.\n"
+        "Only simplify or loosen strategy logic when the user explicitly asks for more trades or a concrete logic bug makes the EA unable to trade as intended.\n"
         "For the first version, prefer defaults that produce several trades in a normal backtest; too many trades is better than zero trades.\n"
         "Unless the user explicitly asks for rare or strict entries, keep thresholds permissive rather than extreme.\n"
         "Avoid stacking too many filters such as long higher-timeframe trend, extreme RSI, band touch, candle pattern, and narrow session all at once.\n"
@@ -276,9 +280,13 @@ def build_improve_system_prompt(platform: str) -> str:
         "- ea_info: Japanese, <= 400 characters.\n"
         "- recommended_params: Japanese. Up to 5 lines. Each line format: 'Name: Range (short note)'.\n"
         "- Preserve the original strategy intent unless the user explicitly asks to change it.\n"
+        "- Strongly preserve the current strategy logic. Do not remove, replace, or rewrite existing logic unless the user explicitly asks for that change or a concrete bug requires it.\n"
+        "- Keep the original indicator set, entry direction, entry conditions, exit conditions, timeframe assumptions, and risk model as unchanged as possible.\n"
+        "- If the request is only a compile fix or small behavior fix, make the minimum possible edit.\n"
+        "- Do not silently optimize, simplify, or redesign the strategy just because another structure looks cleaner.\n"
         "- Fix compiler problems first when error logs are provided.\n"
         "- Modify only what is necessary; keep working parts stable when reasonable.\n"
-        "- If the current entry logic looks too restrictive to trigger, simplify it instead of preserving broken complexity.\n"
+        "- Do not loosen or simplify entry logic unless the user explicitly asks for more trades or the current bug is specifically that the EA never trades.\n"
         "- For the first version, prefer defaults that produce several trades in a normal backtest; too many trades is better than zero trades.\n"
         "- Unless the user explicitly asks for rare or strict entries, keep thresholds permissive rather than extreme.\n"
         "- Avoid stacking too many filters such as long higher-timeframe trend, extreme RSI, band touch, candle pattern, and narrow session all at once.\n"
@@ -750,6 +758,25 @@ def _looks_like_mql_code(text: str) -> bool:
     return hit >= 2
 
 
+def _is_mq_source_filename(filename: str) -> bool:
+    name = (filename or "").strip().lower()
+    return name.endswith(".mq4") or name.endswith(".mq5")
+
+
+def _looks_like_mql_source_file(text: str) -> bool:
+    t = str(text or "").strip()
+    if not t:
+        return False
+    if _looks_like_mql_code(t):
+        return True
+    return bool(
+        re.search(
+            r"\b(?:OnTick|OnInit|OnDeinit|start)\s*\(|#property\s+strict|\binput\s+[A-Za-z_]|#include\s*<|trade\.(?:Buy|Sell|PositionOpen)|OrderSend\s*\(|PositionSelect\s*\(",
+            t,
+        )
+    )
+
+
 def _dedupe_keep_order(items: list[str]) -> list[str]:
     out: list[str] = []
     seen: set[str] = set()
@@ -1150,6 +1177,17 @@ def _collect_trade_frequency_issues(src: str, context_text: str) -> list[str]:
     return _dedupe_keep_order(issues)
 
 
+def _request_mentions_trade_frequency_change(text: str) -> bool:
+    t = str(text or "")
+    return bool(
+        re.search(
+            r"トレード数|取引回数|エントリー回数|もっとトレード|取引を増や|エントリーを増や|約定を増や|zero trade|0 trade|more trades|increase trades|increase entries|more entries|too few trades|never trades",
+            t,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
 def _is_blocking_issue(issue: str) -> bool:
     text = (issue or "").strip()
     if not text:
@@ -1344,7 +1382,9 @@ def _build_improve_user_prompt(
             "",
             "Return a FULL corrected JSON object with exactly these 4 keys: ea_name, ea_info, recommended_params, ea_code.",
             "Keep the behavior close to the original EA unless the request says otherwise.",
-            "If the listed problems indicate zero-trade risk, loosen the default thresholds so the first version produces several trades.",
+            "Do NOT remove or rewrite existing strategy logic unless the request explicitly asks for it or a concrete bug requires it.",
+            "Keep indicators, entry rules, exit rules, timeframe assumptions, and risk logic as unchanged as possible.",
+            "If only a small fix is needed, make only a small fix.",
             "ea_info and recommended_params must be natural Japanese.",
             "No markdown. No explanation.",
         ]
@@ -1385,7 +1425,9 @@ def _build_improve_repair_user_prompt(
             "",
             "Return a FULL corrected JSON object with exactly these 4 keys: ea_name, ea_info, recommended_params, ea_code.",
             "Keep the behavior close to the original EA unless the request says otherwise.",
-            "If the listed problems indicate zero-trade risk, loosen the default thresholds so the first version produces several trades.",
+            "Do NOT remove or rewrite existing strategy logic unless the request explicitly asks for it or a concrete bug requires it.",
+            "Keep indicators, entry rules, exit rules, timeframe assumptions, and risk logic as unchanged as possible.",
+            "If only a small fix is needed, make only a small fix.",
             "No markdown. No explanation.",
         ]
     )
@@ -1479,7 +1521,8 @@ def _generate_validated_improved_ea(
 
         issues = _collect_static_issues(parsed.get("ea_code") or "", platform)
         issues.extend(_collect_context_alignment_issues(parsed.get("ea_code") or "", instruction))
-        issues.extend(_collect_trade_frequency_issues(parsed.get("ea_code") or "", instruction))
+        if _request_mentions_trade_frequency_change(instruction):
+            issues.extend(_collect_trade_frequency_issues(parsed.get("ea_code") or "", instruction))
         blocking_issues, advisory_issues = _partition_issues(issues)
         issues = (blocking_issues + advisory_issues)[:STATIC_ISSUE_LIMIT]
         if not blocking_issues:
@@ -1492,7 +1535,15 @@ def _generate_validated_improved_ea(
     raise HTTPException(status_code=500, detail=f"improve_validation_failed: {detail}")
 
 
-def _build_generation_success_response(candidate: dict[str, str], user_prompt: str, uid: str, is_pro: bool, used_free: int) -> dict:
+def _build_generation_success_response(
+    candidate: dict[str, str],
+    user_prompt: str,
+    uid: str,
+    is_pro: bool,
+    used_free: int,
+    *,
+    count_toward_free_limit: bool = True,
+) -> dict:
     ea_name = _sanitize_ea_name(str(candidate.get("ea_name") or ""))
     ea_info = _normalize_ea_info(candidate.get("ea_info") or "")
     recommended_params = _normalize_recommended_params(candidate.get("recommended_params") or "")
@@ -1507,8 +1558,11 @@ def _build_generation_success_response(candidate: dict[str, str], user_prompt: s
     if is_pro:
         used = used_free
         remaining = 999999
-    else:
+    elif count_toward_free_limit:
         used, remaining = _increment_free_count(uid)
+    else:
+        used = used_free
+        remaining = _remaining_from_state({"is_pro": False, "free_generate_count": used_free})
 
     preview = ea_code_only[:300].replace("\r\n", "\n")
 
@@ -1719,16 +1773,18 @@ def improve(body: ImproveReq, authorization: str = Header(default="")):
     used_free = int(state.get("free_generate_count") or 0)
     remaining = _remaining_from_state(state)
 
-    if (not is_pro) and remaining <= 0:
-        raise HTTPException(status_code=403, detail="free limit reached")
-
     instruction = (body.instruction or "").strip()
     existing_code = str(body.existing_code or "").strip()
+    existing_filename = str(body.existing_filename or "").strip()
     compiler_errors = str(body.compiler_errors or "").strip()
     platform = str(body.platform or "").strip()
 
     if not existing_code:
         raise HTTPException(status_code=422, detail="existing_code is required")
+    if not existing_filename or not _is_mq_source_filename(existing_filename):
+        raise HTTPException(status_code=422, detail="existing .mq4 or .mq5 file is required")
+    if not _looks_like_mql_source_file(existing_code):
+        raise HTTPException(status_code=422, detail="existing_code does not look like an EA source file")
 
     try:
         candidate = _generate_validated_improved_ea(instruction, existing_code, compiler_errors, platform)
@@ -1738,4 +1794,11 @@ def improve(body: ImproveReq, authorization: str = Header(default="")):
         raise HTTPException(status_code=500, detail=f"openai_error: {str(e)}")
 
     success_prompt = instruction or compiler_errors or existing_code[:500]
-    return _build_generation_success_response(candidate, success_prompt, uid, is_pro, used_free)
+    return _build_generation_success_response(
+        candidate,
+        success_prompt,
+        uid,
+        is_pro,
+        used_free,
+        count_toward_free_limit=False,
+    )
