@@ -168,6 +168,10 @@ def build_system_prompt(platform: str) -> str:
         "- prefer one clear, reachable entry setup over too many stacked filters\n"
         "- use consistent bar indexing for signals; closed-bar logic should use the same index for price and indicators\n"
         "- if values are described in pips, implement explicit pip-to-price / pip-to-point conversion for 3/5-digit symbols\n"
+        "- every CopyBuffer call must validate its return value before the buffer values are used\n"
+        "- if the EA places trades, declare and use a MagicNumber and filter positions/history by magic where needed\n"
+        "- if trailing stop, breakeven, or intrabar position management exists, manage open positions before any new-bar gate\n"
+        "- if the strategy mentions swap/carry, include explicit swap-related logic instead of only naming the EA after swap\n"
         "- do not declare dormant inputs or safety features unless they are actually implemented\n"
         "Prefer a simpler but cleaner EA over a complex EA with compile risk.\n"
         f"{_platform_prompt_rules(platform)}"
@@ -188,6 +192,10 @@ def build_repair_system_prompt(platform: str) -> str:
         "If the logic looks overfiltered or internally inconsistent, simplify it so a realistic signal can actually trigger.\n"
         "Use explicit pip conversion helpers when the code exposes pip-based inputs.\n"
         "Use consistent bar indexing for price and indicator signals.\n"
+        "Validate every CopyBuffer call before using indicator values.\n"
+        "If the EA trades, declare and use a MagicNumber and filter positions/history by magic.\n"
+        "If trailing stop, breakeven, or intrabar exits exist, manage them before any new-bar gate.\n"
+        "If the request mentions swap/carry, add explicit swap-related logic.\n"
         "Remove or implement unused inputs such as time-exit or cooldown settings.\n"
         "If ea_info or recommended_params are in English, rewrite them into natural Japanese before returning.\n"
         "Never output markdown, explanations, or code fences.\n"
@@ -210,6 +218,10 @@ def build_improve_system_prompt(platform: str) -> str:
         "- If the current entry logic looks too restrictive to trigger, simplify it instead of preserving broken complexity.\n"
         "- Keep bar references consistent; closed-bar signals should use the same bar index for price and indicators.\n"
         "- Use explicit pip conversion helpers when pip-based inputs are present.\n"
+        "- Validate every CopyBuffer call before using indicator values.\n"
+        "- If the EA trades, declare and use a MagicNumber and filter positions/history by magic.\n"
+        "- If trailing stop, breakeven, or intrabar exits exist, manage them before any new-bar gate.\n"
+        "- If the request mentions swap/carry, add explicit swap-related logic.\n"
         "- Remove or implement unused inputs and dead safety logic.\n"
         "- ea_code must be the FULL source code for one file.\n"
         "- ea_code must stay ASCII only.\n"
@@ -800,6 +812,21 @@ def _collect_trade_viability_issues(src: str, platform: str) -> list[str]:
             "No visible trade entry call was found. The EA should contain at least one reachable order-open path."
         )
 
+    if has_trade_entry and not re.search(r"\bMagic(?:Number)?\b", src):
+        issues.append(
+            "Trading EA should declare and use a MagicNumber so it only manages its own positions and history."
+        )
+
+    if has_trade_entry and "PositionSelect(" in src and "POSITION_MAGIC" not in src:
+        issues.append(
+            "Position management selects symbol positions but does not filter by POSITION_MAGIC."
+        )
+
+    if has_trade_entry and "HistoryDealGet" in src and "DEAL_MAGIC" not in src:
+        issues.append(
+            "History-based loss tracking uses deal history without filtering by DEAL_MAGIC."
+        )
+
     pip_names = _dedupe_keep_order(re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*Pips)\b", src))
     has_pip_helper = bool(
         re.search(r"\b(?:PipSize|PipsToPrice|PipsToPoints|PointsPerPip|PipPoint|PipValue)\b", src)
@@ -828,6 +855,78 @@ def _collect_trade_viability_issues(src: str, platform: str) -> list[str]:
         issues.append(
             "Signal logic mixes current-bar indicator values with previous closed-bar candle data. Use a consistent closed-bar index."
         )
+
+    if re.search(r"(?m)^\s*CopyBuffer\s*\(", src):
+        issues.append(
+            "Check CopyBuffer return values before using indicator buffers; standalone CopyBuffer calls can leave stale or zero data."
+        )
+
+    new_bar_pos = src.find("if(!NewBar()) return;")
+    manage_pos = src.find("ManagePosition();")
+    if (
+        new_bar_pos >= 0
+        and manage_pos > new_bar_pos
+        and ("PositionModify(" in src or "trade.PositionModify(" in src or "trade.PositionClose(" in src)
+    ):
+        issues.append(
+            "Open-position management runs only after the new-bar gate. Trailing, breakeven, and intrabar exits should usually run on every tick."
+        )
+
+    cooldown_assign = re.search(
+        r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*[A-Za-z_][A-Za-z0-9_]*AfterLossBars\b",
+        src,
+    )
+    if cooldown_assign:
+        counter = cooldown_assign.group(1)
+        if re.search(
+            rf"\bif\s*\(\s*{re.escape(counter)}\s*>\s*0\s*\)\s*\{{[^{{}}]*{re.escape(counter)}\s*--[^{{}}]*return\s*;",
+            src,
+            flags=re.DOTALL,
+        ):
+            issues.append(
+                "Loss cooldown logic may reset every bar and prevent trading from ever resuming. Start the cooldown only when the threshold is newly reached."
+            )
+
+    return issues
+
+
+def _collect_context_alignment_issues(src: str, context_text: str) -> list[str]:
+    issues: list[str] = []
+    ctx = (context_text or "").upper()
+
+    if any(token in ctx for token in ["USDTRY", "EURTRY", "GBPTRY", "TRY", "XAU", "GOLD", "XAG", "SILVER", "BTC", "ETH", "NAS100", "US30", "GER40", "JP225"]):
+        m = re.search(
+            r"^\s*input\s+(?:double|int)\s+MaxSpreadPips\s*=\s*([0-9]+(?:\.[0-9]+)?)",
+            src,
+            flags=re.MULTILINE,
+        )
+        if m:
+            try:
+                spread_limit = float(m.group(1))
+                if spread_limit <= 3.0:
+                    issues.append(
+                        "MaxSpreadPips is extremely tight for an exotic, metal, crypto, or index-style symbol and may block all entries."
+                    )
+            except Exception:
+                pass
+
+    if re.search(r"スワップ|SWAP|CARRY", context_text or "", flags=re.IGNORECASE):
+        if not re.search(
+            r"\b(?:POSITION_SWAP|SYMBOL_SWAP_(?:LONG|SHORT)|DEAL_SWAP|SWAP)\b",
+            src,
+            flags=re.IGNORECASE,
+        ):
+            issues.append(
+                "The request mentions swap or carry, but the code contains no explicit swap-related logic."
+            )
+
+    if re.search(r"売りのみ|SELL ONLY|SHORT ONLY", context_text or "", flags=re.IGNORECASE):
+        if re.search(r"\btrade\.Buy\s*\(", src):
+            issues.append("The request is sell-only, but the code still contains a buy entry.")
+
+    if re.search(r"買いのみ|BUY ONLY|LONG ONLY", context_text or "", flags=re.IGNORECASE):
+        if re.search(r"\btrade\.Sell\s*\(", src):
+            issues.append("The request is buy-only, but the code still contains a sell entry.")
 
     return issues
 
@@ -1057,6 +1156,8 @@ def _generate_validated_ea(user_prompt: str) -> dict[str, str]:
             continue
 
         issues = _collect_static_issues(parsed.get("ea_code") or "", platform)
+        issues.extend(_collect_context_alignment_issues(parsed.get("ea_code") or "", user_prompt))
+        issues = _dedupe_keep_order(issues)[:STATIC_ISSUE_LIMIT]
         if not issues:
             return parsed
 
@@ -1104,6 +1205,8 @@ def _generate_validated_improved_ea(
             continue
 
         issues = _collect_static_issues(parsed.get("ea_code") or "", platform)
+        issues.extend(_collect_context_alignment_issues(parsed.get("ea_code") or "", instruction))
+        issues = _dedupe_keep_order(issues)[:STATIC_ISSUE_LIMIT]
         if not issues:
             return parsed
 
