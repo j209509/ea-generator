@@ -8,6 +8,7 @@ import json
 import hmac
 import hashlib
 import secrets
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional, Tuple
 
 import firebase_admin
@@ -55,7 +56,10 @@ except Exception:
 
 STATIC_ISSUE_LIMIT = 12
 
-FREE_LIMIT = 3  # free users can generate up to 3 times
+FREE_GENERATE_LIMIT = 3
+FREE_IMPROVE_LIMIT = 10
+USAGE_RESET_TZ = timezone(timedelta(hours=9))
+USAGE_RESET_TZ_NAME = "Asia/Tokyo"
 # Stripe webhook signing secret (Stripe Dashboard -> Webhooks -> endpoint -> Signing secret)
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "").strip()
 
@@ -555,7 +559,6 @@ def _share_detail_payload(data: dict, share_id: str) -> dict[str, Any]:
             "recommended_params": str(data.get("recommended_params") or ""),
             "ea_code": str(data.get("ea_code") or ""),
             "filename": str(data.get("filename") or ""),
-            "owner_uid": str(data.get("owner_uid") or ""),
         }
     )
     return payload
@@ -565,18 +568,61 @@ def _user_doc_ref(uid: str):
     return db.collection(USERS_COL).document(uid)
 
 
+def _current_usage_month() -> str:
+    return datetime.now(USAGE_RESET_TZ).strftime("%Y-%m")
+
+
+def _usage_count_field(kind: str) -> str:
+    return "free_improve_count" if kind == "improve" else "free_generate_count"
+
+
+def _usage_limit(kind: str) -> int:
+    return FREE_IMPROVE_LIMIT if kind == "improve" else FREE_GENERATE_LIMIT
+
+
+def _normalize_usage_state(data: dict) -> tuple[dict, dict]:
+    normalized = dict(data or {})
+    updates: dict[str, Any] = {}
+    current_month = _current_usage_month()
+
+    if normalized.get("usage_month") != current_month:
+        normalized["usage_month"] = current_month
+        normalized["free_generate_count"] = 0
+        normalized["free_improve_count"] = 0
+        updates["usage_month"] = current_month
+        updates["free_generate_count"] = 0
+        updates["free_improve_count"] = 0
+    else:
+        if "free_generate_count" not in normalized:
+            normalized["free_generate_count"] = 0
+            updates["free_generate_count"] = 0
+        if "free_improve_count" not in normalized:
+            normalized["free_improve_count"] = 0
+            updates["free_improve_count"] = 0
+
+    normalized.setdefault("is_pro", False)
+    return normalized, updates
+
+
 def _get_or_create_user_state(uid: str, email: str | None) -> dict:
     ref = _user_doc_ref(uid)
     snap = ref.get()
     if snap.exists:
         data = snap.to_dict() or {}
-        data.setdefault("is_pro", False)
-        data.setdefault("free_generate_count", 0)
-        return data
+        normalized, updates = _normalize_usage_state(data)
+        if email and not normalized.get("email"):
+            normalized["email"] = email
+            updates["email"] = email
+        if updates:
+            updates["updated_at"] = firestore.SERVER_TIMESTAMP
+            ref.set(updates, merge=True)
+        return normalized
 
     init = {
         "is_pro": False,
         "free_generate_count": 0,
+        "free_improve_count": 0,
+        "usage_month": _current_usage_month(),
         "email": email or "",
         "stripe_customer_id": "",
         "stripe_subscription_id": "",
@@ -589,32 +635,52 @@ def _get_or_create_user_state(uid: str, email: str | None) -> dict:
     return init
 
 
-def _remaining_from_state(state: dict) -> int:
-    if bool(state.get("is_pro")):
+def _remaining_from_state(state: dict, kind: str = "generate") -> int:
+    normalized, _ = _normalize_usage_state(state)
+    if bool(normalized.get("is_pro")):
         return 999999
-    used = int(state.get("free_generate_count") or 0)
-    rem = FREE_LIMIT - used
+    used = int(normalized.get(_usage_count_field(kind)) or 0)
+    rem = _usage_limit(kind) - used
     return rem if rem > 0 else 0
 
 
-def _increment_free_count(uid: str) -> Tuple[int, int]:
+def _increment_free_count(uid: str, kind: str = "generate") -> Tuple[int, int]:
     ref = _user_doc_ref(uid)
+    field = _usage_count_field(kind)
+    limit = _usage_limit(kind)
+    current_month = _current_usage_month()
 
     @firestore.transactional
     def txn_op(txn: firestore.Transaction):
         snap = ref.get(transaction=txn)
         data = snap.to_dict() or {}
         is_pro = bool(data.get("is_pro"))
-        used = int(data.get("free_generate_count") or 0)
+        stored_month = str(data.get("usage_month") or "")
+        same_month = stored_month == current_month
+        generate_used = int(data.get("free_generate_count") or 0) if same_month else 0
+        improve_used = int(data.get("free_improve_count") or 0) if same_month else 0
+        used = improve_used if kind == "improve" else generate_used
         if is_pro:
             return used, 999999
         used2 = used + 1
+        update: dict[str, Any] = {
+            "usage_month": current_month,
+            "updated_at": firestore.SERVER_TIMESTAMP,
+        }
+        if kind == "improve":
+            update[field] = used2
+            if not same_month:
+                update["free_generate_count"] = 0
+        else:
+            update[field] = used2
+            if not same_month:
+                update["free_improve_count"] = 0
         txn.set(
             ref,
-            {"free_generate_count": used2, "updated_at": firestore.SERVER_TIMESTAMP},
+            update,
             merge=True,
         )
-        rem = FREE_LIMIT - used2
+        rem = limit - used2
         rem = rem if rem > 0 else 0
         return used2, rem
 
@@ -1783,6 +1849,7 @@ def _build_generation_success_response(
     is_pro: bool,
     used_free: int,
     *,
+    usage_kind: str = "generate",
     count_toward_free_limit: bool = True,
 ) -> dict:
     ea_name = _sanitize_ea_name(str(candidate.get("ea_name") or ""))
@@ -1796,22 +1863,28 @@ def _build_generation_success_response(
     if not ea_code_only:
         raise HTTPException(status_code=500, detail="failed to obtain ea_code")
 
+    usage_limit = _usage_limit(usage_kind)
     if is_pro:
         used = used_free
         remaining = 999999
     elif count_toward_free_limit:
-        used, remaining = _increment_free_count(uid)
+        used, remaining = _increment_free_count(uid, usage_kind)
     else:
         used = used_free
-        remaining = _remaining_from_state({"is_pro": False, "free_generate_count": used_free})
+        remaining = _remaining_from_state(
+            {"is_pro": False, _usage_count_field(usage_kind): used_free},
+            usage_kind,
+        )
 
     preview = ea_code_only[:300].replace("\r\n", "\n")
 
     return {
         "ok": True,
         "uid": uid,
+        "usage_kind": usage_kind,
         "used": used,
         "remaining": remaining,
+        "limit": usage_limit,
         "model": MODEL,
         "received_prompt_len": len(user_prompt),
         "preview": preview,
@@ -1834,8 +1907,15 @@ def billing_status(authorization: str = Header(default="")):
         "email": email,
         "is_pro": bool(state.get("is_pro")),
         "free_generate_count": int(state.get("free_generate_count") or 0),
-        "free_limit": FREE_LIMIT,
-        "remaining": _remaining_from_state(state),
+        "free_generate_limit": FREE_GENERATE_LIMIT,
+        "free_improve_count": int(state.get("free_improve_count") or 0),
+        "free_improve_limit": FREE_IMPROVE_LIMIT,
+        "usage_month": str(state.get("usage_month") or _current_usage_month()),
+        "usage_reset_timezone": USAGE_RESET_TZ_NAME,
+        "free_limit": FREE_GENERATE_LIMIT,
+        "remaining": _remaining_from_state(state, "generate"),
+        "remaining_generate": _remaining_from_state(state, "generate"),
+        "remaining_improve": _remaining_from_state(state, "improve"),
         "ts": int(time.time()),
     }
 
@@ -1984,7 +2064,7 @@ def generate(body: GenerateReq, authorization: str = Header(default="")):
     state = _get_or_create_user_state(uid, email)
     is_pro = bool(state.get("is_pro"))
     used_free = int(state.get("free_generate_count") or 0)
-    remaining = _remaining_from_state(state)
+    remaining = _remaining_from_state(state, "generate")
 
     if (not is_pro) and remaining <= 0:
         raise HTTPException(status_code=403, detail="free limit reached")
@@ -2000,7 +2080,14 @@ def generate(body: GenerateReq, authorization: str = Header(default="")):
             raise e
         raise HTTPException(status_code=500, detail=f"openai_error: {str(e)}")
 
-    return _build_generation_success_response(candidate, user_prompt, uid, is_pro, used_free)
+    return _build_generation_success_response(
+        candidate,
+        user_prompt,
+        uid,
+        is_pro,
+        used_free,
+        usage_kind="generate",
+    )
 
 
 @app.post("/improve")
@@ -2011,8 +2098,11 @@ def improve(body: ImproveReq, authorization: str = Header(default="")):
 
     state = _get_or_create_user_state(uid, email)
     is_pro = bool(state.get("is_pro"))
-    used_free = int(state.get("free_generate_count") or 0)
-    remaining = _remaining_from_state(state)
+    used_free = int(state.get("free_improve_count") or 0)
+    remaining = _remaining_from_state(state, "improve")
+
+    if (not is_pro) and remaining <= 0:
+        raise HTTPException(status_code=403, detail="free limit reached")
 
     instruction = (body.instruction or "").strip()
     existing_code = str(body.existing_code or "").strip()
@@ -2041,5 +2131,6 @@ def improve(body: ImproveReq, authorization: str = Header(default="")):
         uid,
         is_pro,
         used_free,
-        count_toward_free_limit=False,
+        usage_kind="improve",
+        count_toward_free_limit=True,
     )
