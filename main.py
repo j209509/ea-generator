@@ -57,7 +57,11 @@ except Exception:
 STATIC_ISSUE_LIMIT = 12
 
 FREE_GENERATE_LIMIT = 3
+FREE_GENERATE_REFILL_AMOUNT = 1
 FREE_IMPROVE_LIMIT = 10
+FREE_IMPROVE_REFILL_AMOUNT = 3
+USAGE_REFILL_INTERVAL_DAYS = 7
+USAGE_REFILL_INTERVAL_SECONDS = USAGE_REFILL_INTERVAL_DAYS * 24 * 60 * 60
 USAGE_RESET_TZ = timezone(timedelta(hours=9))
 USAGE_RESET_TZ_NAME = "Asia/Tokyo"
 # Stripe webhook signing secret (Stripe Dashboard -> Webhooks -> endpoint -> Signing secret)
@@ -572,33 +576,136 @@ def _current_usage_month() -> str:
     return datetime.now(USAGE_RESET_TZ).strftime("%Y-%m")
 
 
+def _current_usage_ts() -> int:
+    return int(time.time())
+
+
 def _usage_count_field(kind: str) -> str:
     return "free_improve_count" if kind == "improve" else "free_generate_count"
+
+
+def _usage_remaining_field(kind: str) -> str:
+    return "free_improve_remaining" if kind == "improve" else "free_generate_remaining"
+
+
+def _usage_refill_field(kind: str) -> str:
+    return "free_improve_last_refill_at" if kind == "improve" else "free_generate_last_refill_at"
 
 
 def _usage_limit(kind: str) -> int:
     return FREE_IMPROVE_LIMIT if kind == "improve" else FREE_GENERATE_LIMIT
 
 
-def _normalize_usage_state(data: dict) -> tuple[dict, dict]:
-    normalized = dict(data or {})
-    updates: dict[str, Any] = {}
-    current_month = _current_usage_month()
+def _usage_refill_amount(kind: str) -> int:
+    return FREE_IMPROVE_REFILL_AMOUNT if kind == "improve" else FREE_GENERATE_REFILL_AMOUNT
 
-    if normalized.get("usage_month") != current_month:
-        normalized["usage_month"] = current_month
-        normalized["free_generate_count"] = 0
-        normalized["free_improve_count"] = 0
-        updates["usage_month"] = current_month
-        updates["free_generate_count"] = 0
-        updates["free_improve_count"] = 0
-    else:
-        if "free_generate_count" not in normalized:
-            normalized["free_generate_count"] = 0
-            updates["free_generate_count"] = 0
-        if "free_improve_count" not in normalized:
-            normalized["free_improve_count"] = 0
-            updates["free_improve_count"] = 0
+
+def _coerce_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _coerce_timestamp(value: Any, default: int) -> int:
+    if isinstance(value, datetime):
+        return int(value.timestamp())
+    if value is None:
+        return default
+    try:
+        return int(float(value))
+    except Exception:
+        return default
+
+
+def _legacy_remaining_from_state(data: dict, kind: str) -> int:
+    limit = _usage_limit(kind)
+    used = _coerce_int(data.get(_usage_count_field(kind)) or 0, 0)
+    used = used if used > 0 else 0
+    usage_month = str(data.get("usage_month") or "").strip()
+    if usage_month:
+        if usage_month != _current_usage_month():
+            return limit
+        return max(limit - used, 0)
+    return max(limit - used, 0) if used else limit
+
+
+def _refill_usage_bucket(remaining: int, last_refill_ts: int, kind: str, now_ts: int) -> tuple[int, int]:
+    limit = _usage_limit(kind)
+    remaining = max(0, min(limit, _coerce_int(remaining, limit)))
+    last_refill_ts = _coerce_timestamp(last_refill_ts, now_ts)
+
+    if remaining >= limit:
+        return limit, last_refill_ts
+
+    elapsed = now_ts - last_refill_ts
+    if elapsed < USAGE_REFILL_INTERVAL_SECONDS:
+        return remaining, last_refill_ts
+
+    steps = elapsed // USAGE_REFILL_INTERVAL_SECONDS
+    refilled = remaining + int(steps) * _usage_refill_amount(kind)
+    if refilled >= limit:
+        return limit, now_ts
+
+    return refilled, last_refill_ts + int(steps) * USAGE_REFILL_INTERVAL_SECONDS
+
+
+def _next_refill_ts_from_state(state: dict, kind: str) -> Optional[int]:
+    normalized, _ = _normalize_usage_state(state)
+    if bool(normalized.get("is_pro")):
+        return None
+
+    remaining = _coerce_int(normalized.get(_usage_remaining_field(kind)), _usage_limit(kind))
+    if remaining >= _usage_limit(kind):
+        return None
+
+    last_refill_ts = _coerce_timestamp(normalized.get(_usage_refill_field(kind)), _current_usage_ts())
+    return last_refill_ts + USAGE_REFILL_INTERVAL_SECONDS
+
+
+def _usage_ts_to_iso(ts: Optional[int]) -> Optional[str]:
+    if not ts:
+        return None
+    return datetime.fromtimestamp(ts, tz=USAGE_RESET_TZ).isoformat()
+
+
+def _normalize_usage_state(data: dict) -> tuple[dict, dict]:
+    original = dict(data or {})
+    normalized = dict(original)
+    updates: dict[str, Any] = {}
+    now_ts = _current_usage_ts()
+
+    for kind in ("generate", "improve"):
+        count_field = _usage_count_field(kind)
+        remaining_field = _usage_remaining_field(kind)
+        refill_field = _usage_refill_field(kind)
+        limit = _usage_limit(kind)
+
+        if remaining_field in original:
+            remaining = _coerce_int(original.get(remaining_field), limit)
+        else:
+            remaining = _legacy_remaining_from_state(original, kind)
+            updates[remaining_field] = remaining
+
+        if refill_field in original:
+            last_refill_ts = _coerce_timestamp(original.get(refill_field), now_ts)
+        else:
+            last_refill_ts = now_ts
+            updates[refill_field] = last_refill_ts
+
+        refilled_remaining, effective_last_refill_ts = _refill_usage_bucket(remaining, last_refill_ts, kind, now_ts)
+        used = limit - refilled_remaining
+
+        normalized[remaining_field] = refilled_remaining
+        normalized[refill_field] = effective_last_refill_ts
+        normalized[count_field] = used
+
+        if refilled_remaining != remaining:
+            updates[remaining_field] = refilled_remaining
+        if effective_last_refill_ts != last_refill_ts:
+            updates[refill_field] = effective_last_refill_ts
+        if count_field not in original or _coerce_int(original.get(count_field), 0) != used:
+            updates[count_field] = used
 
     normalized.setdefault("is_pro", False)
     return normalized, updates
@@ -622,7 +729,10 @@ def _get_or_create_user_state(uid: str, email: str | None) -> dict:
         "is_pro": False,
         "free_generate_count": 0,
         "free_improve_count": 0,
-        "usage_month": _current_usage_month(),
+        "free_generate_remaining": FREE_GENERATE_LIMIT,
+        "free_improve_remaining": FREE_IMPROVE_LIMIT,
+        "free_generate_last_refill_at": _current_usage_ts(),
+        "free_improve_last_refill_at": _current_usage_ts(),
         "email": email or "",
         "stripe_customer_id": "",
         "stripe_subscription_id": "",
@@ -639,50 +749,45 @@ def _remaining_from_state(state: dict, kind: str = "generate") -> int:
     normalized, _ = _normalize_usage_state(state)
     if bool(normalized.get("is_pro")):
         return 999999
-    used = int(normalized.get(_usage_count_field(kind)) or 0)
-    rem = _usage_limit(kind) - used
-    return rem if rem > 0 else 0
+    remaining = _coerce_int(normalized.get(_usage_remaining_field(kind)), _usage_limit(kind))
+    return max(0, min(_usage_limit(kind), remaining))
 
 
 def _increment_free_count(uid: str, kind: str = "generate") -> Tuple[int, int]:
     ref = _user_doc_ref(uid)
-    field = _usage_count_field(kind)
+    count_field = _usage_count_field(kind)
+    remaining_field = _usage_remaining_field(kind)
+    refill_field = _usage_refill_field(kind)
     limit = _usage_limit(kind)
-    current_month = _current_usage_month()
+    now_ts = _current_usage_ts()
 
     @firestore.transactional
     def txn_op(txn: firestore.Transaction):
         snap = ref.get(transaction=txn)
         data = snap.to_dict() or {}
-        is_pro = bool(data.get("is_pro"))
-        stored_month = str(data.get("usage_month") or "")
-        same_month = stored_month == current_month
-        generate_used = int(data.get("free_generate_count") or 0) if same_month else 0
-        improve_used = int(data.get("free_improve_count") or 0) if same_month else 0
-        used = improve_used if kind == "improve" else generate_used
+        normalized, pending_updates = _normalize_usage_state(data)
+        is_pro = bool(normalized.get("is_pro"))
+        remaining = _coerce_int(normalized.get(remaining_field), limit)
+        used = limit - remaining
         if is_pro:
             return used, 999999
-        used2 = used + 1
-        update: dict[str, Any] = {
-            "usage_month": current_month,
-            "updated_at": firestore.SERVER_TIMESTAMP,
-        }
-        if kind == "improve":
-            update[field] = used2
-            if not same_month:
-                update["free_generate_count"] = 0
-        else:
-            update[field] = used2
-            if not same_month:
-                update["free_improve_count"] = 0
-        txn.set(
-            ref,
-            update,
-            merge=True,
-        )
-        rem = limit - used2
-        rem = rem if rem > 0 else 0
-        return used2, rem
+        if remaining <= 0:
+            return limit, 0
+
+        effective_last_refill_ts = _coerce_timestamp(normalized.get(refill_field), now_ts)
+        if remaining >= limit:
+            effective_last_refill_ts = now_ts
+
+        remaining_after = remaining - 1
+        used_after = limit - remaining_after
+
+        pending_updates[remaining_field] = remaining_after
+        pending_updates[refill_field] = effective_last_refill_ts
+        pending_updates[count_field] = used_after
+        pending_updates["updated_at"] = firestore.SERVER_TIMESTAMP
+
+        txn.set(ref, pending_updates, merge=True)
+        return used_after, remaining_after
 
     txn = db.transaction()
     return txn_op(txn)
@@ -1871,10 +1976,7 @@ def _build_generation_success_response(
         used, remaining = _increment_free_count(uid, usage_kind)
     else:
         used = used_free
-        remaining = _remaining_from_state(
-            {"is_pro": False, _usage_count_field(usage_kind): used_free},
-            usage_kind,
-        )
+        remaining = max(0, usage_limit - used_free)
 
     preview = ea_code_only[:300].replace("\r\n", "\n")
 
@@ -1902,20 +2004,32 @@ def billing_status(authorization: str = Header(default="")):
     uid = decoded.get("uid") or "unknown"
     email = decoded.get("email")
     state = _get_or_create_user_state(uid, email)
+    remaining_generate = _remaining_from_state(state, "generate")
+    remaining_improve = _remaining_from_state(state, "improve")
+    next_generate_refill_at = _next_refill_ts_from_state(state, "generate")
+    next_improve_refill_at = _next_refill_ts_from_state(state, "improve")
     return {
         "uid": uid,
         "email": email,
         "is_pro": bool(state.get("is_pro")),
-        "free_generate_count": int(state.get("free_generate_count") or 0),
+        "free_generate_count": FREE_GENERATE_LIMIT - remaining_generate if remaining_generate != 999999 else 0,
         "free_generate_limit": FREE_GENERATE_LIMIT,
-        "free_improve_count": int(state.get("free_improve_count") or 0),
+        "free_generate_remaining": remaining_generate,
+        "free_generate_refill_amount": FREE_GENERATE_REFILL_AMOUNT,
+        "free_generate_next_refill_at": _usage_ts_to_iso(next_generate_refill_at),
+        "free_improve_count": FREE_IMPROVE_LIMIT - remaining_improve if remaining_improve != 999999 else 0,
         "free_improve_limit": FREE_IMPROVE_LIMIT,
-        "usage_month": str(state.get("usage_month") or _current_usage_month()),
+        "free_improve_remaining": remaining_improve,
+        "free_improve_refill_amount": FREE_IMPROVE_REFILL_AMOUNT,
+        "free_improve_next_refill_at": _usage_ts_to_iso(next_improve_refill_at),
+        "usage_month": None,
         "usage_reset_timezone": USAGE_RESET_TZ_NAME,
+        "usage_model": "rolling_refill",
+        "usage_refill_interval_days": USAGE_REFILL_INTERVAL_DAYS,
         "free_limit": FREE_GENERATE_LIMIT,
-        "remaining": _remaining_from_state(state, "generate"),
-        "remaining_generate": _remaining_from_state(state, "generate"),
-        "remaining_improve": _remaining_from_state(state, "improve"),
+        "remaining": remaining_generate,
+        "remaining_generate": remaining_generate,
+        "remaining_improve": remaining_improve,
         "ts": int(time.time()),
     }
 
